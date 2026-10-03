@@ -1,0 +1,1068 @@
+[
+ {
+  "id": "T01",
+  "title": "Add synth.py: importable synthetic gait with true steps, true down vector and gyro",
+  "area": "fixtures-eval",
+  "files": [
+   "synth.py"
+  ],
+  "problem": "No importable synthetic signal generator exists in the repo. simulate.py:13-26 is an infinite `while True` loop that POSTs each sample to http://localhost:8000/data (simulate.py:23) and returns nothing; train.py:58-59 `sys.exit(\"No recordings in data/ yet.\")` fires because data/ holds only .gitkeep. orientation.gravity_complementary (orientation.py:21-32) is never called: server.py:7 and train.py:17 import only gravity_lowpass and vertical_horizontal. The only offline generator is scratchpad/harness.py:7-30, which returns (acc, true_steps) with no ground-truth down vector and no gyro, so neither gravity estimator's error can be measured. scratchpad/dsp/synth2.py (40 lines) is a verified superset: scratchpad/merge/check.py prints `identical {} True True`, `identical {'stride_asym': 0.5} True True`, `identical {'swing_deg': 30} True True` against harness.make.",
+  "change": "Create /home/user/qmind-step-detector/synth.py as a copy of /tmp/claude-0/-home-user-qmind-step-detector/655412f7-a8ac-5f04-b939-88265a9acdb4/scratchpad/dsp/synth2.py with two edits: delete the `sys.path.insert(...)` line and replace `FS = 100` with `from orientation import FS` (orientation.py:7; orientation.py has no import side effects). Public API, unchanged from synth2: `make(mode_seq, seed=0, stride_asym=0.0, swing_deg=0.0, f_walk=1.8, f_run=2.8, amp_walk=3.0, amp_run=9.0, width=0.06, noise=0.25) -> (acc (N,3) float m/s^2 phone frame, true_steps int, true_down (N,3) unit vectors phone frame, gyro (N,3) rad/s body frame)` and `ang_err_deg(est, true) -> (N,) degrees`. mode_seq is a list of (mode, seconds) with mode in {'still','walk','run'}; N = sum(int(seconds*FS)). Keep the heel-strike formula identical to simulate.py:18-19 (`vert = a*exp(-((s-0.1)/width)**2) - a*0.15`, world = [0.6 sin(pi phase), 0.3 sin(2 pi phase), 9.81+vert]). Gyro sign convention must satisfy gravity_complementary's update `rotated = g[i-1] - cross(gyro[i]*dt, g[i-1])` (orientation.py:29-30): with M_i the phone-frame rotation, dM = M_i @ M_{i-1}.T, theta = [dM[2,1]-dM[1,2], dM[0,2]-dM[2,0], dM[1,0]-dM[0,1]]/2, gyro[i] = -theta*FS, gyro[0] = 0. Add a 3-line module docstring stating the return tuple so other tasks can unpack `acc, true, *_ = synth.make(...)` when they need only the signal.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import synth; from orientation import gravity_complementary, FS; a,n,d,g=synth.make([('walk',30)],swing_deg=30); print(a.shape,n); print(round(float(synth.ang_err_deg(gravity_complementary(a,g,k=1.0),d)[2*FS:].mean()),2))\" prints exactly `(3000, 3) 54` then `0.67`. python3 -c \"import synth; a,n,d,g=synth.make([('walk',10)]); print(a.shape,n,d.shape,g.shape)\" prints `(1000, 3) 18 (1000, 3) (1000, 3)`. python3 -c \"import synth; print(synth.make([('run',60)], f_run=3.2, amp_run=9.0)[1], synth.make([('walk',60)], f_walk=1.4, amp_walk=2.0)[1])\" prints `192 83`. `grep -c 'sys.path' synth.py` prints `0`.",
+  "depends_on": [],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier re-ran all three acceptance commands against a scratch copy built exactly as described (scratchpad/verify-fixtures-eval/synth.py): outputs `(3000, 3) 54` / `0.67`, `(1000, 3) 18 (1000, 3) (1000, 3)`, `192 83`. The file is ~40 lines, so it sits on the S/M boundary; M kept. Caveat (Inference): determinism relies on np.random.default_rng and np.linalg.qr sign conventions, which are stable within one numpy version (2.4.6 here) but not guaranteed across major versions; every expected number in T02/T03/T09/T10 inherits this."
+ },
+ {
+  "id": "T02",
+  "title": "Add make_fixtures.py: write 24 deterministic synthetic recordings in train.py's folder layout with steps.txt",
+  "area": "fixtures-eval",
+  "files": [
+   "make_fixtures.py",
+   ".gitignore"
+  ],
+  "problem": "data/ contains only .gitkeep and nothing in the repo can produce a recording folder. train.py:54 globs `data/*`, train.py:55 splits the basename on `_` into person/activity/placement, and train.py:23-36 load() reads TotalAcceleration.csv columns x,y,z by name (train.py:33), so train.py and any evaluator have nothing to read. README.md:51 tells recorders to write steps.txt but no code in the repo writes or reads it (grep -rn steps.txt: README.md:51 is the only hit). The ML lens's numbers (976 windows; leave-one-placement-out A 89% / B 100% / C 94%) came from scratchpad/abc.py (4 persons x 3 activities x 2 placements, seeds 1..24, x/y/z-only CSVs). Verifier regenerated the 24 folders with the 5-column layout below and ran the unmodified train.py against them (cwd with data -> fixtures): it printed `976 windows from 4 people, placements: ['hand', 'pocket']`, placement split A 89% / B 100% / C 94%, person split 100/100/100, in 7.4 s. The offline hop-0.2 s counter gives 872 true / 880 counted, 24/24 within 3%.",
+  "change": "Create make_fixtures.py importing `make` from synth (T01) and `FS` from orientation. (1) `write_recording(folder, acc, true_steps)`: `os.makedirs(folder, exist_ok=True)`; `t = np.arange(len(acc))/FS`; write `TotalAcceleration.csv` with pandas (`index=False`) and columns exactly, in order, `time,seconds_elapsed,x,y,z` where `time = (t*1e9).astype(np.int64)` (Sensor Logger's epoch-nanosecond column) and `seconds_elapsed = t`; write `steps.txt` containing `f\"{true_steps}\\n\"`. Never delete or empty the target directory (so `--out data` can never destroy real recordings). (2) `if __name__ == '__main__':` argparse with `--out DIR` (default `data_synth`) and `--seed INT` (default 0). `seed = args.seed`; `for person in ['p1','p2','p3','p4']: for activity, secs in [('walk',30),('run',20),('still',20)]: for placement, kw in [('hand',{'swing_deg':30}),('pocket',{'stride_asym':0.5})]: seed += 1; acc, true, *_ = make([(activity,secs)], seed=seed, **kw); write_recording(f'{args.out}/{person}_{activity}_{placement}', acc, true)`. This nesting order reproduces abc.py's seeds 1..24 exactly. Folder names must be exactly `<person>_<activity>_<placement>` so train.py:55 parses them; do not write mixed-activity folders here (T10a). (3) Append one line `data_synth*/` to .gitignore (currently `__pycache__/`, `.true_steps`, `.DS_Store`). Keep make_fixtures.py under 45 lines.",
+  "acceptance": "cd /home/user/qmind-step-detector && rm -rf data_synth && python3 make_fixtures.py --out data_synth && ls data_synth | wc -l && head -1 data_synth/p1_walk_hand/TotalAcceleration.csv && wc -l < data_synth/p1_walk_hand/TotalAcceleration.csv && cat data_synth/p1_walk_hand/steps.txt data_synth/p1_run_hand/steps.txt data_synth/p1_still_hand/steps.txt && grep -c 'data_synth' .gitignore prints `24`, `time,seconds_elapsed,x,y,z`, `3001`, `54`, `55`, `0`, `1`. Then `mkdir -p /tmp/tcwd && ln -sfn /home/user/qmind-step-detector/data_synth /tmp/tcwd/data && cd /tmp/tcwd && python3 /home/user/qmind-step-detector/train.py | head -1` prints `976 windows from 4 people, placements: ['hand', 'pocket']` (valid until T07 changes train.py's CLI; after T07 use its data_dir argument instead).",
+  "depends_on": [
+   "T01"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier ran the exact spec (scratchpad/verify-fixtures-eval/make_fixtures.py): 24 folders, 4.2 MB total, steps.txt walk=54 run=55 still=0, and the unmodified train.py gave 976 windows / A 89 B 100 C 94 on the 5-column CSVs. The `time` (ns since epoch) and `seconds_elapsed` column names are documented in the vendored Sensor Logger notes (scratchpad/sl/README.md:114,118; sl/UNITS.md:9-10), so they are no longer Unverified; only x,y,z are read by train.py:33 anyway. If T10a's --hard folders are later written into the same directory the 976-window figure no longer applies; T07's acceptance must use a plain `--out` run."
+ },
+ {
+  "id": "T03",
+  "title": "Add eval_dsp.py: cadence, half-rule and down-direction metrics on synthetic data",
+  "area": "fixtures-eval",
+  "files": [
+   "eval_dsp.py"
+  ],
+  "problem": "Nothing in the repo measures cadence error, half-rule failures (steps.py:21-23) or orientation error; scratchpad/harness.py:55-56 prints only step counts and the set of cadence values. The defects that T22, T23, T25 and T28 fix were established with scratch scripts (scratchpad/dsp/e1_resolution.py, e2_halfrule.py, e3_tau.py, e6_candidates.py, e7_reorient.py) that are not in the repo, so a fix cannot be checked for regression against a fixed set of numbers.",
+  "change": "Create eval_dsp.py (no CLI args, always exits 0) using synth.make (T01) with default seed 0. Helper: vertical = `vertical_horizontal(acc, gravity_lowpass(acc))[0]`; windows = `[v[s:s+200] for s in range(100, len(v)-200, 50)]`. Print exactly six lines, every value as `round(float(x), 3)`: (1) `cadence worst_median_abs_err_hz=<x>` = max over f_true in `np.arange(1.5, 3.31, 0.1)` (mode 'walk' if f_true<2.4 else 'run'; `make([(mode,30)], f_walk=f_true, f_run=f_true)`) of `np.median(|steps.cadence_hz(w)-f_true|)` over windows; (2) `halving run2.8_asym1.0=<frac> walk1.8_asym1.0=<frac>` = fraction of windows with cadence_hz(w) < 0.75*f_true for `make([('run',30)], stride_asym=1.0)` (f_true 2.8) and `make([('walk',30)], stride_asym=1.0)` (1.8); (3) `doubling walk1.8_width0.02=<frac>` = fraction with cadence_hz(w) > 1.5*1.8 for `make([('walk',30)], width=0.02)`; (4) `down_err_deg lowpass walk=<x> run=<x> walk_swing30=<x> run_swing30=<x>` = `synth.ang_err_deg(gravity_lowpass(acc), true_down)[200:].mean()` for `make([(m,30)])` and `make([(m,30)], swing_deg=30)`, m in walk/run; (5) same four cases printed with prefix `down_err_deg complementary` using `gravity_complementary(acc, gyro)` with its current defaults; (6) `reorient settle_s tau1.0=<x>`: `a1,_,d1,_ = make([('walk',15)], seed=0)`, `a2,_,d2,_ = make([('walk',15)], seed=7)`, `acc = np.vstack([a1,a2])`, `down = np.vstack([d1,d2])`, `e = synth.ang_err_deg(gravity_lowpass(acc, tau_s=1.0), down)`, value = `np.argmax(e[1500:] < 5) / FS` (index counted from sample 1500, not absolute).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 eval_dsp.py; echo exit=$? on the unmodified steps.py/orientation.py prints exactly these six lines then `exit=0`: `cadence worst_median_abs_err_hz=0.5`, `halving run2.8_asym1.0=0.759 walk1.8_asym1.0=0.259`, `doubling walk1.8_width0.02=0.0`, `down_err_deg lowpass walk=0.433 run=0.311 walk_swing30=18.603 run_swing30=18.727`, `down_err_deg complementary walk=0.827 run=0.593 walk_swing30=0.819 run_swing30=0.578`, `reorient settle_s tau1.0=2.51`. Runs in about 2 s.",
+  "depends_on": [
+   "T01"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier implemented the spec literally (scratchpad/verify-fixtures-eval/eval_dsp.py, 50 lines) and got exactly the six lines above in 1.9 s; the original note's '60 s runtime' was wrong. The original acceptance quoted 2-decimal values (0.76, 0.26, 18.6) that the 3-decimal format never prints; replaced with the exact strings. Item (6) was ambiguous ('first index after sample 1500'); it is the offset within e[1500:], matching scratchpad/dsp/e7_reorient.py."
+ },
+ {
+  "id": "T06",
+  "title": "Add tests/run.py: dependency-free test runner with non-zero exit on failure",
+  "area": "fixtures-eval",
+  "files": [
+   "tests/run.py"
+  ],
+  "problem": "pytest is not installed (`python3 -c 'import pytest'` -> ModuleNotFoundError: No module named 'pytest') and requirements.txt:1-3 lists only numpy, pandas, scikit-learn. There is no tests/ directory and no single command that runs every test and fails on any assertion. A plain `python3 tests/run.py` puts tests/ (not the repo root) first on sys.path, so test files' `import steps` fails unless the runner adds the root: verifier reproduced `ModuleNotFoundError: No module named 'steps'` with a runner that omitted it.",
+  "change": "Create tests/run.py (~25 lines): `HERE = os.path.dirname(os.path.abspath(__file__))`; `sys.path.insert(0, os.path.dirname(HERE))` BEFORE importing any test file so `import steps/orientation/server/train` resolves from any cwd. Optional substring filter `sys.argv[1]` applied to the test file basename. For each `sorted(glob.glob(os.path.join(HERE, 'test_*.py')))`: load with `importlib.util.spec_from_file_location(basename_without_py, path)` + `module_from_spec` + `spec.loader.exec_module`; for each `name in sorted(dir(mod))` where `name.startswith('test_')` and the attribute is callable: call it inside try/except Exception; on success print `PASS {name}`, on failure print `FAIL {name}: {exc!r}` to stdout and `traceback.print_exc()` to stderr. Finally print `{passed} passed, {failed} failed` and `sys.exit(1 if failed else 0)`. Do not reset server module globals in the runner; server tests keep their own reset (T13/T14).",
+  "acceptance": "cd /home/user/qmind-step-detector && mkdir -p tests && printf 'import steps\\ndef test_ok():\\n    assert steps.classify({\"v_std\": 0.1, \"cadence_hz\": 0}) == \"STILL\"\\ndef test_fail():\\n    assert False\\n' > tests/test_zz_tmp.py && python3 tests/run.py zz_tmp 2>/dev/null; echo exit=$?; rm tests/test_zz_tmp.py; python3 tests/run.py 2>/dev/null | tail -1; echo exit=$? prints `FAIL test_fail: AssertionError()`, `PASS test_ok`, `1 passed, 1 failed`, `exit=1`, then (with whatever real tests exist, or none) a line ending `, 0 failed` and `exit=0`.",
+  "depends_on": [],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier prototyped the runner (scratchpad/verify-fixtures-eval/tests/run.py) and observed exactly the PASS/FAIL/summary lines and exit codes above. Dependency on T04 dropped: the runner needs no test file to be written, and its acceptance is self-contained with a temporary test; it picks up T04, T05, T11, T13, T14 automatically when they land. T11's known-failure case must not be named test_* (see T11)."
+ },
+ {
+  "id": "T09",
+  "title": "Add evaluate.py: counted vs true steps per recording and overall, 3% gate",
+  "area": "fixtures-eval",
+  "files": [
+   "evaluate.py"
+  ],
+  "problem": "README.md:92 sets the Accuracy pair's target 'within 3%' and README.md:51 asks every recorder to write steps.txt, but `grep -rn steps.txt` over the repo hits only README.md:51: nothing reads it and no script compares a count to it, so the 3% target is unmeasurable. `train.load` cannot be reused yet because importing train executes train.py:53-74 at module level and `python3 -c 'import train'` exits 1 with `No recordings in data/ yet.` (train.py:58-59), hence the T07 dependency.",
+  "change": "Create evaluate.py (~45 lines) with argparse `--data DIR` (default `data`). `from train import load` (T07 main guard) and `from steps import count_steps` (T08). For each `sorted(glob.glob(os.path.join(DIR, '*')))` that is a directory: if no steps.txt, print `warning: {name}: no steps.txt, skipped` and continue; else `acc = load(folder)`, `true = int(open(.../steps.txt).read().strip())`, `count, states = count_steps(acc)`, `err_pct = (count-true)/true*100 if true else float('nan')`, `ok = abs(err_pct) <= 3.0 if true else count == 0`. Print one row per folder: `f\"{name:24s} true={true:4d} counted={count:4d} err={err_pct:+6.1f}% {'ok' if ok else 'FAIL'}\"`, except when true==0 print the literal `err=   n/a ` (same 11-char width) in place of the err field. After the loop: if no rows, print `no recordings found` and `sys.exit(2)`; else `overall_err = (C-T)/T*100 if T else 0.0`, print `f\"overall: true={T} counted={C} err={overall_err:+.1f}%  {n_ok}/{n} recordings within 3%\"` and `sys.exit(0 if abs(overall_err) <= 3 and n_ok == n else 1)`. Keep the label column for T10b.",
+  "acceptance": "cd /home/user/qmind-step-detector && rm -rf data_synth && python3 make_fixtures.py --out data_synth && python3 evaluate.py --data data_synth; echo exit=$? prints 24 rows including `p1_run_hand              true=  55 counted=  56 err=  +1.8% ok`, `p1_still_hand            true=   0 counted=   0 err=   n/a  ok`, every walk row `true=  54 counted=  54 err=  +0.0% ok`, then `overall: true=872 counted=880 err=+0.9%  24/24 recordings within 3%` and `exit=0`. Also `python3 evaluate.py --data data; echo exit=$?` prints `no recordings found` and `exit=2`.",
+  "depends_on": [
+   "T02",
+   "T07",
+   "T08"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier recomputed every row with the hop-0.2 s windowed counter from scratchpad/eval/proto.py (count_windowed) on the T02 fixtures: walks 54/54, runs 56/55 (+1.8%), stills 0/0, overall 872/880 (+0.9%), 24/24 ok. These expected numbers hold ONLY if T08's steps.count_steps(acc) implements exactly that algorithm: 3 s warm-up (first end=300), hop 20 samples, classify on the last 2 s, detect_steps on the last 4 s, accept a peak when gi > last+25 and gi < end-20, and returns (count, states) with one state per hop. A 55-step recording has 1.65 steps of slack, so the per-recording ok flag is the binding gate."
+ },
+ {
+  "id": "T10a",
+  "title": "make_fixtures.py --hard: two stride-asymmetry-1.0 recordings plus a mixed walk/run recording in a sibling directory",
+  "area": "fixtures-eval",
+  "files": [
+   "make_fixtures.py"
+  ],
+  "problem": "The default fixtures (T02) all pass, so the known weakness cannot be exercised: a running signal with pocket-leg stride asymmetry 1.0 is labelled WALKING in 201 of 286 hops because the half-frequency rule (steps.py:21-23) picks the ~1.4 Hz peak, even though the step count survives via the overlapping 4 s detection windows. No mixed walk/run recording exists for the counter. A mixed folder cannot sit in the training tree because train.py:55 would take 'mixed' as its activity label.",
+  "change": "In make_fixtures.py add `--hard` (store_true) to the argparse in the main block. When set, after the 24 default folders also call `write_recording(f'{args.out}/dave_run_pocket', *make([('run',60)], seed=3, stride_asym=1.0)[:2])` and `write_recording(f'{args.out}/dave_walk_pocket', *make([('walk',60)], seed=7, stride_asym=1.0)[:2])`, and write `erin_mixed_pocket` = `make([('walk',20),('run',20),('walk',20)], seed=99)` ONLY under the sibling directory `f'{args.out}_mixed'`. About 8 added lines; keep the `data_synth*/` .gitignore line from T02 (it already covers `data_synth_mixed`).",
+  "acceptance": "cd /home/user/qmind-step-detector && rm -rf data_synth data_synth_mixed && python3 make_fixtures.py --out data_synth --hard && ls data_synth | wc -l && ls data_synth_mixed && cat data_synth/dave_run_pocket/steps.txt data_synth/dave_walk_pocket/steps.txt data_synth_mixed/erin_mixed_pocket/steps.txt prints `26`, `erin_mixed_pocket`, `167`, `108`, `128`.",
+  "depends_on": [
+   "T02"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Split from T10 (fixture half). Verifier generated all three with the spec (scratchpad/verify-fixtures-eval/make_fixtures.py --hard): true steps 167 / 108 / 128. A tree written with --hard has 26 folders, so T07's '976 windows' expectation must be checked on a plain --out run, not a --hard one."
+ },
+ {
+  "id": "T10b",
+  "title": "evaluate.py: per-recording activity-label accuracy column and overall label accuracy line",
+  "area": "fixtures-eval",
+  "files": [
+   "evaluate.py"
+  ],
+  "problem": "A step-count-only report hides the classification error: on dave_run_pocket (T10a) the hop-0.2 s counter returns 168 steps for 167 true (+0.6%, passes) while only 85 of its 286 hop states are RUNNING and 201 are WALKING (steps.py:21-23 half-frequency rule choosing the ~1.4 Hz asymmetry peak; steps.py:46 then labels cadence 1.5 Hz as WALKING). evaluate.py (T09) prints nothing about the `states` list that count_steps returns.",
+  "change": "In evaluate.py: derive the expected label from the folder name's second underscore field, `{'walk':'WALKING','run':'RUNNING','still':'STILL'}.get(name.split('_')[1])`; when it is None (e.g. `erin_mixed_pocket`) print `label= n/a` and exclude the recording from the overall figure. Otherwise `pct = 100*sum(s == expected for s in states)/len(states)` and append ` label={pct:3.0f}%` to that recording's row. Accumulate matching hops and total hops over labelled recordings and, after the overall step line, print `label accuracy: {100*matching/total:.1f}%` (hop-weighted). Keep the exit code driven by step error only (T09 rule). About 12 added lines.",
+  "acceptance": "cd /home/user/qmind-step-detector && rm -rf data_synth data_synth_mixed && python3 make_fixtures.py --out data_synth --hard && python3 evaluate.py --data data_synth | grep -E 'dave|overall|label accuracy'; echo exit=$? prints `dave_run_pocket          true= 167 counted= 168 err=  +0.6% ok label= 30%` (on the unmodified steps.cadence_hz; `label=100%` once T28 has merged), `dave_walk_pocket         true= 108 counted= 108 err=  +0.0% ok label=100%`, `overall: true=1147 counted=1156 err=+0.8%  26/26 recordings within 3%`, `label accuracy: 93.4%` (100.0% once T28 has merged) and `exit=0`. `python3 evaluate.py --data data_synth_mixed | grep erin` prints `erin_mixed_pocket        true= 128 counted= 128 err=  +0.0% ok label= n/a`.",
+  "depends_on": [
+   "T09",
+   "T10a"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Split from T10 (report half). Verifier measured with the proto hop-0.2 s counter (same assumption on T08 as T09): dave_run_pocket 168/167 with Counter({'WALKING': 201, 'RUNNING': 85}) = 29.7% -> `label= 30%`; dave_walk_pocket 108/108, 286/286 WALKING; erin 128/128. Hop totals: 8 walk folders x 136 + 16 run/still folders x 86 + 2 x 286 = 3036 hops, 201 mismatches -> 93.4%. With the T28 candidate cadence (8x zero-pad, ratio 0.6) monkeypatched into steps.cadence_hz, dave_run_pocket became RUNNING in 286/286 hops with the count unchanged at 168, so the post-T28 expectation is now Verified (100%, not merely >= 90%). Downstream T43 (depends on T10) should depend on T10a and T10b."
+ },
+ {
+  "id": "T05",
+  "title": "Add tests/test_orientation.py: regression tests for gravity_lowpass, gravity_complementary and vertical_horizontal",
+  "area": "orientation",
+  "files": [
+   "tests/test_orientation.py"
+  ],
+  "problem": "orientation.py has no tests. gravity_lowpass (orientation.py:10-18) and vertical_horizontal (orientation.py:35-42) are the 'find down' step everything rests on (called from server.py:41-42 and train.py:40-41), and gravity_complementary (orientation.py:21-32) is never called anywhere (server.py:7 and train.py:17 import only FS, gravity_lowpass, vertical_horizontal), so a regression in any of them would go unnoticed. T22/T23/T25a all edit orientation.py and need a guard-rail.",
+  "change": "Create tests/test_orientation.py with plain asserts (no pytest import; pytest is NOT installed in this container). Top: `import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))`, then `import numpy as np; from orientation import FS, gravity_lowpass, gravity_complementary, vertical_horizontal; from steps import cadence_hz`. Fixture: `rng = np.random.default_rng(1); R, _ = np.linalg.qr(rng.normal(size=(3, 3)))`; phone-frame acc = `world @ R` (equals R.T @ world per sample). test_static_down: world = np.tile([0, 0, 9.81], (500, 1)).astype(float); g = gravity_lowpass(acc); v, h, down = vertical_horizontal(acc, g); assert np.abs(down[-1] - R.T @ np.array([0, 0, 1.0])).max() < 1e-6 and abs(v[-1]) < 1e-6 and h[-1] < 1e-6. test_complementary_zero_gyro: gc = gravity_complementary(acc, np.zeros_like(acc)); same down assertion < 1e-6. test_bounce_cadence_after_rotation: t = np.arange(10 * FS) / FS; world x = y = 0, z = 9.81 + 2 * np.sin(2 * np.pi * 1.8 * t); acc = world @ R; v, h, _ = vertical_horizontal(acc, gravity_lowpass(acc)); assert abs(cadence_hz(v[FS:]) - 1.8) < 0.15 and h[FS:].max() < 1e-6. `if __name__ == '__main__':` call the three functions in order and print('ok'). Any assert failure must leave a non-zero exit (a bare AssertionError does).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 tests/test_orientation.py; echo exit=$?  -> prints `ok` then `exit=0`. Measured on the current code: static down error 6.7e-16, |v| 1.6e-14, h 8.5e-15; complementary zero-gyro error 6.7e-16; rotated-bounce cadence 1.7778 Hz (0.111 Hz bins of a 9 s window), h max 8.2e-15. Negative check: `python3 -c \"import sys; sys.path.insert(0,'tests'); import test_orientation as t; t.R[:] = 0; t.test_static_down()\"` must exit non-zero (AssertionError or numpy error) proving the assertions are live.",
+  "depends_on": [],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Ran the three tests verbatim in scratchpad/verify-orientation/t05_tests.py: ok, exit 0. Still passes after T22 (zeros_like gyro has acc's shape), T23 (inputs are non-empty, fs defaults to 100) and T25a (the norm floor is output-identical for |g|=9.81, measured max diff 0.0). Do not import pytest: `python3 -m pytest` reports 'No module named pytest' here. T04 is not a prerequisite; just use the same sys.path/`__main__` pattern."
+ },
+ {
+  "id": "T22",
+  "title": "gravity_complementary: default k=0.995 and validate gyro shape, dtype and units",
+  "area": "orientation",
+  "files": [
+   "orientation.py"
+  ],
+  "problem": "orientation.py:21 defaults k=0.98, i.e. 2% accelerometer weight per sample (0.5 s time constant), so with no rotation the fused estimate is NOISIER than gravity_lowpass: 0.83 vs 0.43 deg (walk), 0.59 vs 0.31 deg (run). With k=0.995 it is 0.23/0.17 deg with no swing and 0.23/0.20 deg under a 30 deg arm swing, where the lowpass is 18.6/18.7 deg off. There is no input validation: a gyro of the wrong length raises IndexError at orientation.py:29 (`gyro[i]`), gyro=None raises TypeError there, an empty acc raises IndexError at orientation.py:26, and a gyro mistakenly in deg/s overflows at orientation.py:30 and returns NaN silently (measured: all-NaN down with no exception). A wrong-sign gyro at k=0.995 gives 37.8 deg error on a 30 deg swing, worse than the lowpass, so the sign convention g_i = g_{i-1} - (gyro*dt) x g_{i-1} must be documented.",
+  "change": "In gravity_complementary(acc, gyro, k=0.995): first lines `acc = np.asarray(acc, float); gyro = np.asarray(gyro, float)`; `if len(acc) == 0: raise ValueError('gravity_complementary needs at least one sample')`; `if gyro.shape != acc.shape: raise ValueError(f'gyro shape {gyro.shape} must equal acc shape {acc.shape}')`; `if np.abs(gyro).max() > 35: raise ValueError('gyro max |w| > 35 rad/s (2000 deg/s): are these deg/s? expected rad/s')`. Keep the loop as is. Docstring: gyro is body-frame angular rate in rad/s (Sensor Logger 'gyroscope' stream / Gyroscope.csv, rad/s per UNITS.md), same axes as acc; must be sampled on the same grid as acc (resample first, see T24); sign convention: the filter applies g <- g - (w*dt) x g, so a positive rotation rate about +x must move a down vector along +y toward +z (T44 checks this on a real phone); 1-k is the per-sample accelerometer weight, k=0.995 is about a 2 s time constant; synthetic result: 0.2 deg error under 30 deg arm swing vs 19 deg for gravity_lowpass; a 1 deg/s gyro bias costs about 2 deg at k=0.995.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import numpy as np, synth, orientation as o\\nfor name, kw in [('walk', {}), ('run', {}), ('walk_swing30', dict(swing_deg=30)), ('run_swing30', dict(swing_deg=30))]:\\n    a, n, d, w = synth.make([(name.split('_')[0], 30)], **kw)\\n    print(name, round(float(synth.ang_err_deg(o.gravity_complementary(a, w), d)[200:].mean()), 2), round(float(synth.ang_err_deg(o.gravity_lowpass(a), d)[200:].mean()), 2))\" prints complementary errors 0.23, 0.17, 0.23, 0.20 (each within 0.05) and lowpass errors 0.43, 0.31, 18.6, 18.7 (each within 0.1), i.e. the fused estimate beats the lowpass in all four lines. Then each of these must exit non-zero with ValueError in the traceback: python3 -c \"import numpy as np,orientation as o; o.gravity_complementary(np.zeros((300,3)),np.zeros((10,3)))\"; python3 -c \"import numpy as np,orientation as o; o.gravity_complementary(np.zeros((300,3)),None)\"; python3 -c \"import numpy as np,orientation as o; o.gravity_complementary(np.zeros((300,3)),np.full((300,3),100.0))\"; python3 -c \"import numpy as np,orientation as o; o.gravity_complementary(np.zeros((0,3)),np.zeros((0,3)))\". Finally python3 tests/test_orientation.py prints ok, and `python3 eval_dsp.py | grep -i complementary` still prints a line (its numbers should match the ones above).",
+  "depends_on": [
+   "T03"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "All numbers re-measured in scratchpad/verify-orientation/t22_t23_t25.py with scratchpad/dsp/synth2.py (seed 0, 30 s). The acceptance assumes T01's synth.py exposes make(mode_seq, seed=0, stride_asym=0.0, swing_deg=0.0) -> (acc, true_steps, down, gyro) and ang_err_deg(est, true) exactly like synth2.py; if T01 named them differently, adapt the command, the expected numbers hold only if the RNG draw order matches synth2.py (Inference). CORRECTION to the original note: the 0.75-0.97 deg bias figure was measured at k=0.98; at k=0.995 a 1 deg/s bias gives 2.0 deg, noise 0.02 rad/s gives 0.26 deg. No caller passes k today (gravity_complementary has no callers: server.py:7, train.py:17), so the default change breaks nothing; T24 must resample the gyro onto acc's sample grid before calling, because the shape check now raises. The 35 rad/s guard is a units sanity check only: a slowly moved phone in deg/s can stay below it, which is why T44 also prints median |gyro|."
+ },
+ {
+  "id": "T23",
+  "title": "gravity_lowpass: empty-input guard, fs parameter, documented tau_s trade-off with a reorientation metric",
+  "area": "orientation",
+  "files": [
+   "orientation.py",
+   "eval_dsp.py"
+  ],
+  "problem": "orientation.py:15 `g[0] = acc[:FS].mean(axis=0)` on an empty array emits 'Mean of empty slice' then IndexError (re-verified), and silently averages fewer samples when len(acc) < FS (len 50 works). alpha at orientation.py:13 hard-codes the module-level FS, so a stream at another rate silently changes the effective tau. The tau_s=1.0 default is undocumented; measured trade-off on synthetic walk: noise-floor error 0.84/0.43/0.24/0.13 deg for tau 0.5/1/2/4 s, but after an abrupt 88.6 deg re-orientation at t=15 s the estimate takes 1.26/2.51/5.05/10.14 s to get within 5 deg and the 15 s after the turn count 27/27/25/23 of 27 true steps (scratchpad/dsp/e7_reorient.py, re-run).",
+  "change": "Change the signature to gravity_lowpass(acc, tau_s=1.0, fs=FS): `acc = np.asarray(acc, float)`; `if len(acc) == 0: raise ValueError('gravity_lowpass needs at least one sample')`; `alpha = 1 / (1 + tau_s * fs)`; `g[0] = acc[:max(1, int(round(fs)))].mean(axis=0)` (fs may be a float such as 99.7 from a measured rate; `acc[:99.7]` raises TypeError, verified). Keep tau_s=1.0 and state in the docstring: noise floor ~0.4 deg at 1 s vs ~0.8 deg at 0.5 s, but settling after a pocket turn is ~2.5*tau_s (2.5 s at 1 s, 5 s at 2 s), and the step counter loses steps during settling. Callers server.py:41 and train.py:40 pass acc positionally and are unaffected. In eval_dsp.py replace the single reorient line with: 'reorient settle_s tau0.5=<x.xx> tau1.0=<x.xx> tau2.0=<x.xx> steps_after_turn tau0.5=<n> tau1.0=<n> tau2.0=<n>' computed exactly as scratchpad/dsp/e7_reorient.py does: a1 = synth.make([('walk',15)], seed=0), a2 = synth.make([('walk',15)], seed=7), acc = vstack, true down = vstack; settle_s = first index after sample 1500 with angular error < 5 deg, divided by 100; steps_after_turn = len(steps.detect_steps(vertical[1500:], 'WALKING')) where vertical comes from vertical_horizontal(acc, gravity_lowpass(acc, tau_s=tau)).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 eval_dsp.py | grep reorient prints 'reorient settle_s tau0.5=1.26 tau1.0=2.51 tau2.0=5.05 steps_after_turn tau0.5=27 tau1.0=27 tau2.0=25' (settle within 0.1 s, steps within 1 of these values; the true count after the turn is 27). python3 -c \"import numpy as np,orientation as o; o.gravity_lowpass(np.zeros((0,3)))\" exits non-zero with ValueError (not IndexError) in the traceback. python3 -c \"import numpy as np,orientation as o; print(o.gravity_lowpass(np.tile([0,0,9.81],(300,1)).astype(float), fs=99.7)[-1].round(3))\" prints [0.    0.    9.81 ] (float fs accepted). python3 tests/test_orientation.py prints ok.",
+  "depends_on": [
+   "T03",
+   "T22"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Numbers from scratchpad/dsp/e3_tau.py and e7_reorient.py, both re-run here; they hold if T01's synth.py reproduces scratchpad/dsp/synth2.py for seeds 0 and 7 (Inference). Depends on T22 only to serialise edits to orientation.py. The fs parameter has no caller until something measures a rate: T18 resamples the server buffer to 100 Hz, and train.py has no resampling task, so this is a hook, not a fix. Whether real phones deliver exactly 100 Hz is Unverified (T17 measures it)."
+ },
+ {
+  "id": "T25a",
+  "title": "orientation.py: gravity_ok(g) plausibility check and a norm floor in vertical_horizontal",
+  "area": "orientation",
+  "files": [
+   "orientation.py"
+  ],
+  "problem": "orientation.py:38 divides by np.linalg.norm(g) with no floor: an all-zero g row yields NaN vertical, NaN horizontal and NaN down (re-verified with scratchpad/dsp/e4_gnorm.py case e). When the accelerometer stream arrives without gravity (iOS 'accelerometer' before any 'gravity' packet; server.py:27-28 adds nothing in that case), the lowpass |g| is about 0.08 m/s^2 and the estimated down is 82.6 deg wrong, yet nothing in orientation.py can tell a caller that the gravity estimate is implausible. A sustained +2 m/s^2 offset (|g|=11.7) is handled fine (54/54 steps) because vertical = along - |g| (orientation.py:40) removes it.",
+  "change": "In orientation.py add module constants `G_MIN, G_MAX = 5.0, 14.0` and `def gravity_ok(g): \"\"\"True when the median |g| over the window is a plausible gravity (m/s^2).\"\"\"; n = np.linalg.norm(np.asarray(g, float), axis=1); return G_MIN < float(np.median(n)) < G_MAX`. In vertical_horizontal replace lines 38-40 with `norm = np.maximum(np.linalg.norm(g, axis=1, keepdims=True), 1e-6); down = g / norm; along = np.sum(acc * down, axis=1); vertical = along - norm[:, 0]`; keep horizontal and the return tuple unchanged. Docstring for G_MIN: measured lowpass median |g| on synthetic data is 9.4-9.8 without swing, 7.2 for a 60 deg stride-rate arm swing (worst 8 s window 7.16), 4.9 for a 90 deg swing (flagged, accepted), and <= 1.1 for every user-acceleration-only stream.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import numpy as np,synth,orientation as o; a,*_=synth.make([('walk',10)]); g=o.gravity_lowpass(a); print(o.gravity_ok(g), o.gravity_ok(o.gravity_lowpass(a-g))); a6,*_=synth.make([('run',30)],swing_deg=60); print(o.gravity_ok(o.gravity_lowpass(a6))); print(bool(np.isfinite(np.concatenate(o.vertical_horizontal(np.ones((3,3)),np.zeros((3,3)))[:2])).all())); v0,h0,d0=o.vertical_horizontal(a,g); print(float(np.abs(v0).max()>0))\" prints 'True False', 'True', 'True', 'True'. python3 tests/test_orientation.py prints ok (the floor is output-identical for |g|=9.81: measured max diff 0.0 on a synthetic walk).",
+  "depends_on": [
+   "T23"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Split from T25 (orientation half). G_MIN lowered from 6.0 to 5.0 after measuring margins in scratchpad/verify-orientation/t22_t23_t25.py: user-only streams give median |g| 0.00-1.02 across walk/run/still/swing30/swing60, so any G_MIN in 2-6 catches the real failure; swing60 running sits at 7.2 and swing90 at 4.86, so 6.0 left only ~1.2 m/s^2 of headroom on vigorous arm swing. A stream scaled by 0.5 (median |g| 4.4-4.9) is still flagged at 5.0, but that scenario is not one Sensor Logger produces (it sends m/s^2 or g, server.py:39 handles g). Real arm-swing amplitude is Unverified. Depends on T23 only to serialise edits to orientation.py."
+ },
+ {
+  "id": "T25b",
+  "title": "server: refuse to count or report when gravity is implausible, and show the reason on the dashboard",
+  "area": "server-demo",
+  "files": [
+   "server.py",
+   "dashboard.html"
+  ],
+  "problem": "When the stream is user acceleration only (iOS 'accelerometer' with no 'gravity' packet; server.py:27-28 adds nothing), server.py:39-40 multiplies by 9.81 because the median |a| < 3 (measured 0.71), gravity_lowpass then yields median |g| 0.84, down is 83 deg wrong, and the live replay counted 67 steps for 54 true (+24%) and labelled 12 windows RUNNING (scratchpad/dsp/e4_gnorm.py case c, re-run). state() (server.py:33-56) never reports that gravity is implausible and dashboard.html:30 shows nothing but 'waiting for phone\u2026' when ready is false, so a mis-configured phone looks like a working one or a dead one.",
+  "change": "server.py: import gravity_ok from orientation. In state(), right after `g = gravity_lowpass(acc)`: `if not gravity_ok(g): return {\"ready\": False, \"error\": f\"no gravity: |g| median {np.median(np.linalg.norm(g, axis=1)):.1f} m/s^2 - enable Gravity/TotalAcceleration in Sensor Logger\"}`. Apply the same early return (do not count) in the counting function that T12 moved into ingest (T12 names it _count_locked). dashboard.html: in tick() add an else branch to `if(s.ready){...}` (line 30-46): `else{document.getElementById('tilt').textContent=s.error||'waiting for phone\u2026';}` and keep the step count untouched. No other dashboard changes.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import synth,server,orientation as o; a,*_=synth.make([('walk',10)]); u=a-o.gravity_lowpass(a); server.ingest([{'name':'totalacceleration','time':int(i*1e7),'values':dict(zip('xyz',map(float,v)))} for i,v in enumerate(u)]); s=server.state(); print(s['ready'], s['error'][:10], server.steps['count'])\" prints 'False no gravity 0'. Then the positive control: python3 -c \"import synth,server; a,*_=synth.make([('walk',10)]); server.ingest([{'name':'totalacceleration','time':int(i*1e7),'values':dict(zip('xyz',map(float,v)))} for i,v in enumerate(a)]); s=server.state(); print(s['ready'], s['state'], server.steps['count']>0)\" prints 'True WALKING True'. grep -c \"s.error\" dashboard.html prints 1.",
+  "depends_on": [
+   "T25a",
+   "T24"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Split from T25 (server + dashboard half); the original listed only orientation.py and server.py and made the dashboard line optional, which left the user-facing half of the problem unfixed. The acceptance packets carry a 'time' field in epoch nanoseconds at 100 Hz (Sensor Logger payload[].time is UTC epoch ns, scratchpad/sl/PUSHING.md:22,38) so the command survives T17/T18's rate measurement and resampling; if T12/T16 renamed ingest's entry point or the counter dict, adapt the names (Inference, those tasks' code does not exist yet). Depends on T24 to serialise edits to server.py. T26 (listed as depending on T25) should now depend on T25b; T27 also edits dashboard.html and must come after this."
+ },
+ {
+  "id": "T44",
+  "title": "Record one hand-held walk with Gyroscope on; confirm gyro units, sign convention and lowpass-vs-gyro error on a real phone",
+  "area": "orientation",
+  "files": [
+   "gyro_check.py",
+   "README.md"
+  ],
+  "problem": "Everything in T22/T24 is established on synthetic data where the gyro is perfect, sampled on the accelerometer grid, and the swing is a pure sinusoid. Unverified on a real phone: that Gyroscope.csv is rad/s (scratchpad/sl/UNITS.md:39 says so, but it is community documentation), that its sign convention matches orientation.py:30's g - (w*dt) x g (a wrong sign at k=0.995 gives 37.8 deg error on a synthetic 30 deg swing vs 0.23 deg with the right sign, worse than the 18.6 deg lowpass), that the gyro and acceleration CSVs share a timestamp grid (scratchpad/sl/README.md:334-358 shows they must be interpolated together), and that a real arm swing actually moves the lowpass down estimate by tens of degrees. README.md:89 asks exactly this. data/ is empty.",
+  "change": "Human part: one team member records 60 s of walking with the phone in hand (arm swinging) with Accelerometer, Gravity and Gyroscope enabled at 100 Hz, exports CSV, unzips to data/<name>_walk_hand/ with a steps.txt. Agent part: write gyro_check.py (<= 40 lines) that takes a folder: acc = train.load(folder) (T07 made train importable; it handles TotalAcceleration.csv or Accelerometer+Gravity); ta = TotalAcceleration.csv or Accelerometer.csv 'seconds_elapsed'; gy = pd.read_csv('Gyroscope.csv'); gyro = np.column_stack([np.interp(ta, gy.seconds_elapsed, gy[c]) for c in 'xyz'])[:len(acc)]; ref = Gravity.csv x,y,z interpolated onto ta the same way; print median |gyro| (rad/s), the measured accelerometer rate 1/median(diff(ta)), and three mean angular errors vs ref over t >= 2 s using synth.ang_err_deg: gravity_lowpass(acc), gravity_complementary(acc, gyro), gravity_complementary(acc, -gyro). Then paste the printed lines into the README paragraph T42 added (README section 5, the Orientation row at README.md:89), stating which gyro sign won; if -gyro wins, add a one-line note that T24 must negate the gyro.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 gyro_check.py data/*_walk_hand prints: 'gyro median |w| = <v> rad/s' with v below 20 (a value in the hundreds means deg/s and the 35 rad/s guard from T22 will have raised); 'acc rate = <r> Hz' (answers T17's question); and 'down error deg: lowpass=<a> complementary(+gyro)=<b> complementary(-gyro)=<c>' where all three are below 90 (a value near 180 means Gravity.csv has the opposite sign to the acceleration frame and the script must negate ref) and min(b, c) < a. The README Orientation row then contains those numbers. Exit code 0.",
+  "depends_on": [
+   "T22",
+   "T42"
+  ],
+  "size": "M",
+  "needs_human": true,
+  "evidence": "Unverified",
+  "notes": "The only task that needs a phone. Changed from the original: the gyro is interpolated onto the accelerometer timestamps (T22 now raises on a shape mismatch, and Sensor Logger logs each sensor with its own time column); the sign check (+gyro vs -gyro) is added because synthetic results show the wrong sign is worse than no gyro; T24 dropped from depends_on because the check is offline (it needs orientation.py, synth.ang_err_deg from T01 via T42->T03, and train.load from T07 via T42->T41->T35->T34); files list now names the script and README instead of 'data/'. Size raised to M (two files). Gravity.csv is CoreMotion's own fused estimate, a fair reference but not ground truth. CSV names Gyroscope.csv / Gravity.csv / TotalAcceleration.csv and the rad/s unit come from the awesome-sensor-logger docs mirrored in scratchpad/sl (UNITS.md:18-19,39; README.md:346); whether an iOS export contains TotalAcceleration.csv or only Accelerometer.csv+Gravity.csv is Unverified, train.load handles both."
+ },
+ {
+  "id": "T04",
+  "title": "Add tests/test_steps.py: regression tests for cadence_hz, classify, detect_steps on synthetic signals",
+  "area": "frequency",
+  "files": [
+   "tests/test_steps.py"
+  ],
+  "problem": "steps.py has no tests. cadence_hz (steps.py:12-24) swaps to the half-frequency peak whenever it exceeds 0.4x the band max (steps.py:21-23); detect_steps (steps.py:49-62) uses a state-dependent min_gap (steps.py:56: 0.28 s RUNNING, 0.4 s otherwise) that halves a 2.8 Hz count when the state is WALKING; classify (steps.py:42-46) has three hard-coded thresholds (0.4, 2.35, 5). Any change by the Frequency or Accuracy pair can silently break these and nothing would notice. pytest is not installed (verified: ModuleNotFoundError).",
+  "change": "Create tests/test_steps.py (plain asserts, pytest-compatible names, runnable with python3). Start with `import sys; from os.path import abspath, dirname; sys.path.insert(0, dirname(dirname(abspath(__file__))))`, then `from orientation import FS` and `from steps import cadence_hz, classify, detect_steps`. Helpers: `sine(f, secs)` = np.sin(2*pi*f*t) and `spikes(f, secs, amp=3.0)` = amp*exp(-((ph-0.1)/0.06)**2) - amp*0.15 with ph=(f*t)%1, t=np.arange(secs*FS)/FS. Tests: test_cadence_resolution: abs(cadence_hz(sine(1.8,10))-1.8)<1e-6 and abs(cadence_hz(sine(2.8,10))-2.8)<1e-6; cadence_hz(sine(1.8,2))==2.0 and cadence_hz(sine(2.8,2))==3.0 with comment 'documents the 0.5 Hz bins of a raw 2 s window; T28 relaxes this'. test_cadence_harmonic: cadence_hz(sine(1.8,10)+0.8*sine(3.6,10))\u22481.8; cadence_hz(spikes(1.8,10))\u22481.8; cadence_hz(spikes(2.8,10))\u22482.8 (all abs 1e-6). test_classify: {'v_std':0.1,'cadence_hz':2.0}->STILL; {'v_std':2.0,'cadence_hz':1.8}->WALKING; {'v_std':2.0,'cadence_hz':3.0}->RUNNING; {'v_std':6.0,'cadence_hz':1.5}->RUNNING. test_detect_steps: len(detect_steps(spikes(1.8,10),'WALKING'))==18; len(detect_steps(spikes(2.8,10),'RUNNING'))==28; len(detect_steps(spikes(2.8,10),'STILL'))==0; len(detect_steps(spikes(2.8,10),'WALKING'))==14 with comment 'known limitation: wrong state halves a running count (T31)'. End with `if __name__=='__main__': [f() for n,f in list(globals().items()) if n.startswith('test_')]; print('ok')`. Do not import synth.py or anything outside steps/orientation so the file has no dependency on T01.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 tests/test_steps.py; echo exit=$?  -> prints `ok` then `exit=0`. Negative check: `python3 -c \"import sys; sys.path.insert(0,'.'); import tests.test_steps as t; t.test_detect_steps()\"` exits 0; editing steps.py:56 to 0.4 for RUNNING would make it raise AssertionError (28 becomes 14).",
+  "depends_on": [],
+  "size": "M",
+  "evidence": "Verified",
+  "needs_human": false,
+  "notes": "All 18 expected values re-derived against the current steps.py (scratchpad/verify-frequency/t04_check.py): 1.8 / 2.8000000000000003 / 2.0 / 3.0 / 1.8 / 1.8 / 2.8 for cadence; STILL/WALKING/RUNNING/RUNNING; 18/28/0/14 for detect_steps. The literal file (scratchpad/verify-frequency/tests/test_steps.py) is 52 lines, prints ok with exit 0, and is picked up by the T06 runner draft (4 passed). Size relabelled S->M because 52 lines exceeds the 40-line S limit. T28 (padded cadence) and T38 (model-backed classify) each update one assertion here and depend on this task."
+ },
+ {
+  "id": "T28",
+  "title": "cadence_hz: zero-pad FFT 8x and raise the half-frequency ratio to 0.6",
+  "area": "frequency",
+  "files": [
+   "steps.py",
+   "tests/test_steps.py"
+  ],
+  "problem": "steps.py:8-9 spectrum() takes rfft of the raw 2 s window (200 samples at FS=100, orientation.py:7), so bins are 0.5 Hz apart; cadence_hz (steps.py:17-20) can only return 1.0,1.5,...,4.0, the spm display (server.py:55, round(cadence*60)) jumps by 30, and the worst median cadence error over 1.5-3.3 Hz is 0.5 Hz (re-measured: eval_dsp prints worst_median_abs_err_hz=0.5 today). The half-frequency rule at steps.py:21-23 swaps to the bin near best/2 whenever it exceeds 0.4*max; with running stride asymmetry 1.0 the stride subharmonic at 1.4 Hz lies inside the 1-4 Hz band, so run 2.8 Hz reports 1.5 Hz in 76% of windows and classify (steps.py:46) labels only 24% RUNNING; walk 1.8 asym 1.0 is halved in 26% of windows (re-measured, scratchpad/verify-frequency/t28_claims.py). Removing the rule is not an option: without it a 1.8 Hz walk reports the 3.5 Hz harmonic in 57% (strike width 0.06), 78% (0.03) and 74% (0.02) of windows.",
+  "change": "Change the signature to cadence_hz(x, pad=8, ratio=0.6). Inside, do not call spectrum(); compute n = len(x)*pad; xw = (x - x.mean()) * np.hanning(len(x)); f = np.fft.rfftfreq(n, 1/FS); a = np.abs(np.fft.rfft(xw, n)). Keep band = (f>=1)&(f<=4), fb, ab = f[band], a[band], best = fb[np.argmax(ab)], half = (fb > best/2-0.3)&(fb < best/2+0.3), and `if half.any() and ab[half].max() > ratio*ab.max()` in place of 0.4. Leave spectrum() untouched (server.py:51 dashboard plot and features() band energies at steps.py:29-32 use it). features() calls cadence_hz(vertical) with defaults (steps.py:34), so server.py:44 and train.py:47-49 need no edits. Update the docstring: resolution 100/(200*8)=0.0625 Hz on a 2 s window; ratio 0.6 chosen because 0.4 still halves asymmetric running (19% of windows) and asymmetric walking (41-57%), while 0.8 doubles sharp-strike walking in up to 26% of windows (strike width 0.02). In tests/test_steps.py replace the two exact 2 s assertions with `abs(cadence_hz(sine(1.8,2))-1.8) < 0.07` and `abs(cadence_hz(sine(2.8,2))-2.8) < 0.07` (padded values are 1.8125 and 2.8125) and drop the 'T28 relaxes this' comment; the 10 s, harmonic and spike assertions stay as they are (they still hold: 1.8, 2.8, 1.8, 1.8, 2.8).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import numpy as np; from steps import cadence_hz; t=np.arange(200)/100; print(cadence_hz(np.sin(2*np.pi*1.8*t)), cadence_hz(np.sin(2*np.pi*2.8*t)))\" prints `1.8125 2.8125`; python3 tests/test_steps.py; echo exit=$? prints `ok` and `exit=0`; python3 eval_dsp.py prints `cadence worst_median_abs_err_hz=0.025`, `halving run2.8_asym1.0=0.0 walk1.8_asym1.0=0.111` and `doubling walk1.8_width0.02=0.0` (each number within 0.02; before the change the same lines read 0.5, 0.759/0.259 and 0.0).",
+  "depends_on": [
+   "T03",
+   "T04"
+  ],
+  "size": "M",
+  "evidence": "Verified",
+  "needs_human": false,
+  "notes": "All acceptance numbers reproduced by running the verifier's eval_dsp copy with the new cadence patched in (scratchpad/verify-frequency/t28_check.py): 0.025 / 0.0, 0.111 / 0.0; runtime 1.9 s. The eval_dsp label strings assume T03 prints the labels used in scratchpad/verify-fixtures-eval/eval_dsp.py; if T03's wording differs, match the numbers. Side effects to know about: classify's 2.35 Hz threshold (steps.py:46) now sees a continuous cadence, so a 2.3 Hz fast walk that used to round up to 2.5 (RUNNING) now reports 2.3125 (WALKING); T39 gives the data to retune it. On the T02 pocket fixtures (stride_asym 0.5) halving is 0% before and after, so T09's counts should not move. The formerly known-fail run stride_asym=1.0 case in T11 labels 100% of windows RUNNING with this change; flipping that marker is T28b, not part of this task."
+ },
+ {
+  "id": "T28b",
+  "title": "tests/test_classify.py: flip the run stride_asym=1.0 known-fail to a passing assertion once T28 has landed",
+  "area": "classify-ml",
+  "files": [
+   "tests/test_classify.py"
+  ],
+  "problem": "T11 marks the run 2.8 Hz, stride_asym=1.0 case as a known failure because cadence_hz (steps.py:21-23) halves it to 1.5 Hz in 76% of 2 s windows and classify (steps.py:46) then labels only 24% RUNNING. With T28's padded cadence and ratio 0.6 the same signal labels 100% of windows RUNNING (measured in scratchpad/verify-frequency/t28_claims.py), so the marker goes stale and, if T11 asserts the failure to document it, tests/test_classify.py would start failing after T28.",
+  "change": "Open tests/test_classify.py as merged by T11. For the run stride_asym=1.0 case, remove the known-fail marker (whatever form T11 used: a KNOWN-FAIL print, an expected-failure flag or an inverted assertion) and replace it with a plain assertion that >= 90% of 2 s windows of synth.make([('run',30)], stride_asym=1.0) classify as RUNNING, using the same window loop the file already uses for its other cases. Rename the function test_run_asym and keep the file's printed line format so it prints 'PASS run stride_asym=1.0 ...'. Do not touch the other cases.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 tests/test_classify.py; echo exit=$?  -> output contains a line starting `PASS run stride_asym=1.0`, contains no line with `KNOWN-FAIL`, and ends with `exit=0`. Sanity: `git stash` of the steps.py change from T28 makes the same command report that case failing (24% RUNNING).",
+  "depends_on": [
+   "T28",
+   "T11"
+  ],
+  "size": "S",
+  "evidence": "Inference",
+  "needs_human": false,
+  "notes": "The behaviour flip (24% -> 100% RUNNING) is Verified; the exact marker format depends on how T11 is written, which is why the evidence label is Inference. If T11 lands after T28, the T11 agent should write this case as a plain pass and this task becomes a no-op (close it with a one-line note)."
+ },
+ {
+  "id": "T29",
+  "title": "Add spectrogram.py --synth: walk vs run spectrogram CSV with cadence peak and 2x harmonic ratio per window",
+  "area": "frequency",
+  "files": [
+   "spectrogram.py",
+   ".gitignore"
+  ],
+  "problem": "README.md:90 assigns the Frequency pair 'Spectrograms of walk vs run. Show the cadence peak and its 2\u00d7 harmonic' and the pitch (README.md:104) relies on showing the peak move from walking to running, but the repo has no spectrogram code; the only spectrum view is the live 2 s plot in dashboard.html:39-44 fed by server.py:51-52. matplotlib is not installed (verified: ModuleNotFoundError). train.py cannot be imported for its loader until T07 because importing it runs the experiment and sys.exits at train.py:53-59, so recording-folder input is split into T29b.",
+  "change": "Create spectrogram.py with a main guard and argparse: `--synth` (required for now; T29b adds a folder positional) and `--out` (default 'spectrogram.csv'). With --synth: `import synth; acc, true, *_ = synth.make([('walk',20),('run',20)])`. Then g = gravity_lowpass(acc); v, _, _ = vertical_horizontal(acc, g). For s in range(100, len(v)-200, 50): w = v[s:s+200]; f, a = steps.spectrum(w); keep = f <= 8 (same cut as server.py:52, 17 bins 0.0..8.0). Write the CSV header once as 't_s,' + ','.join(f'{x:.1f}' for x in f[keep]) and one row per window f'{s/FS:.2f},' + ','.join(f'{x:.5f}' for x in a[keep]). Per window compute c = steps.cadence_hz(w), ic = argmin|f-c|, i2 = argmin|f-2c|, ratio2x = a[i2]/a[ic] and print exactly f't={s/FS:.2f} cadence={c:.3f} ratio2x={ratio2x:.2f}'. After the loop: try `import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt` and, on success, imshow the (window x bin) matrix transposed with time on x and Hz on y, overlay cadence and 2*cadence as two lines, savefig('spectrogram.png'); on ImportError print 'matplotlib not installed, csv only'. Keep the plotting branch to <= 10 lines inside the try. Append 'spectrogram.csv' and 'spectrogram.png' to .gitignore.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 spectrogram.py --synth | tee /tmp/spec.log | tail -1 prints `matplotlib not installed, csv only`; head -1 spectrogram.csv prints a header starting `t_s,0.0,0.5,1.0` and ending `,8.0`; wc -l spectrogram.csv prints `75 spectrogram.csv`; grep -c '^t=' /tmp/spec.log prints `74`; awk -F'[= ]' '/^t=/{ if ($2<=18.5 && ($4<1.5||$4>2.0)) bad++; if ($2>=20 && ($4<2.5||$4>3.0)) bad++ } END{print bad+0}' /tmp/spec.log prints `0` (today the walk windows read 2.0 x35 and 1.5 x1, run windows 3.0 x36; after T28 they read 1.75-1.94 and 2.8125, still inside those ranges).",
+  "depends_on": [
+   "T01"
+  ],
+  "size": "M",
+  "evidence": "Verified",
+  "needs_human": false,
+  "notes": "Window count verified: N=4000, s from 100 to 3750 step 50 = 74 windows, 75 lines with header (scratchpad/verify-frequency/t29_check.py). The windows starting at t=19.0 and 19.5 straddle the walk->run switch and report 2.5/3.0, which is why the acceptance uses t<=18.5 / t>=20 rather than t<20 / t>20 as originally written. ratio2x median is about 0.67 for both walk and run today; with 0.5 Hz bins the 2x harmonic of 1.8 Hz (3.6) falls between bins, so the ratio is coarse until T28 lands. The matplotlib branch cannot be run here (Unverified); add 'matplotlib' to requirements.txt only if the team wants the PNG."
+ },
+ {
+  "id": "T29b",
+  "title": "spectrogram.py: accept a recording folder via train.load",
+  "area": "frequency",
+  "files": [
+   "spectrogram.py"
+  ],
+  "problem": "T29 produces spectrograms only from synthetic data; the pitch (README.md:104) needs them on the team's recordings in train.py's folder layout (train.py:3-5), and train.load (train.py:23-36) is only importable once T07 adds a main guard.",
+  "change": "In spectrogram.py add an optional positional `folder` (argparse nargs='?') in a mutually exclusive group with --synth. When folder is given: `from train import load; acc = load(folder)`; everything after (gravity_lowpass, vertical_horizontal, the window loop, CSV, prints, optional PNG) stays as in T29. Print a one-line usage error if neither is given.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 make_fixtures.py --out data_synth && python3 spectrogram.py data_synth/p1_walk_hand | grep -c '^t=' prints `54`; wc -l spectrogram.csv prints `55 spectrogram.csv`; python3 spectrogram.py data_synth/p1_walk_hand | awk -F'[= ]' '/^t=/ && ($4<1.5||$4>2.0){bad++} END{print bad+0}' prints `0` (today every window reads 2.0; after T28, 1.75-1.8125).",
+  "depends_on": [
+   "T29",
+   "T07",
+   "T02"
+  ],
+  "size": "S",
+  "evidence": "Verified",
+  "needs_human": false,
+  "notes": "54 windows measured on the verifier's copy of the T02 fixture p1_walk_hand (3000 samples: range(100, 2800, 50)) using the same CSV columns train.load reads (scratchpad/verify-frequency/t29_post28.py); p1_run_pocket (20 s) gives 34 windows all at 3.0."
+ },
+ {
+  "id": "T07",
+  "title": "Make train.py importable: build_dataset/evaluate functions, main guard, data_dir argument",
+  "area": "classify-ml",
+  "files": [
+   "train.py"
+  ],
+  "problem": "train.py:53-74 runs the whole experiment at module import time and train.py:58-59 `sys.exit(\"No recordings in data/ yet.\")` kills the importer when data/ is empty: `python3 -c 'import train'` exits 1 today (re-run: prints `No recordings in data/ yet.`, exit=1, 1.5 s). `from train import load, windows` (needed by T09, T36, T39) therefore either runs a full RandomForest sweep or exits the process. train.py:54 globs the relative path 'data/*', so running from any other cwd silently finds nothing.",
+  "change": "In train.py move lines 53-61 into `def build_dataset(data_dir):` that globs `os.path.join(data_dir, '*')`, keeps the same row dicts, raises `SystemExit(f'No recordings in {data_dir} yet.')` when `rows` is empty, prints the existing summary line (line 61) and returns `df`. Move lines 63-74 into `def evaluate(df):`. Add at the bottom `if __name__ == '__main__': data_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'); evaluate(build_dataset(data_dir))`. Keep load(), windows(), WIN and all printed output unchanged.",
+  "acceptance": "cd /tmp && python3 -c \"import sys; sys.path.insert(0,'/home/user/qmind-step-detector'); import train; print('imported', callable(train.build_dataset), callable(train.evaluate), train.load.__name__)\" prints exactly `imported True True load` within 5 s (sklearn import alone is ~1.5 s) and no accuracy lines. cd /home/user/qmind-step-detector && python3 train.py data_synth; echo exit=$? prints `976 windows from 4 people, placements: ['hand', 'pocket']`, then the two Leave-one-*-out blocks with the placement block reading `A 89%`, `B 100%`, `C 94%` and the person block all 100%, then `exit=0`. mkdir -p /tmp/empty_data && python3 train.py /tmp/empty_data; echo exit=$? prints `No recordings in /tmp/empty_data yet.` and `exit=1`.",
+  "depends_on": [
+   "T02"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier re-ran the import (exit 1) and recomputed 976 windows / A 89% B 100% C 94% (per-fold A hand 78% pocket 100%; C hand 100% pocket 88%) on the 24-folder seeds-1..24 fixture copy with the exact train.py windows() code (scratchpad/verify-classify-ml/exp_train.py). T02's extra time/seconds_elapsed columns are ignored by train.py:33. T02 is needed only for the acceptance data, not for the code change."
+ },
+ {
+  "id": "T11",
+  "title": "Add tests/test_classify.py: synthetic regression test for the classify rule, with the known half-cadence failure marked",
+  "area": "classify-ml",
+  "files": [
+   "tests/test_classify.py"
+  ],
+  "problem": "There is no test of steps.classify (steps.py:42-46). The measured failure (running with stride asymmetry 1.0 labelled WALKING because cadence_hz, steps.py:21-23, halves to 1.5 Hz and v_std 3.67 < 5) is recorded nowhere a teammate would trip over it. Re-measured: seed 3 gives 20/54 RUNNING (0.37), seed 7 gives 17/54 (0.31). Also: a RandomForest trained on the synthetic set (T37) labels those same windows run 54/54, so a test that calls `classify` would silently change result the moment model.joblib appears (T38); the test must pin the rule. pytest is not installed, so plain asserts.",
+  "change": "Create tests/test_classify.py with `sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))`. Imports: `from synth import make`, `from orientation import FS, gravity_lowpass, vertical_horizontal`, `from steps import features`, and `try: from steps import classify_rule as classify\\nexcept ImportError: from steps import classify` (so it always tests the hand rule, before and after T38). Helper `frac(mode, label, **kw)`: `acc = make([(mode, 30)], seed=7, **kw)[0]; v, h, _ = vertical_horizontal(acc, gravity_lowpass(acc)); labels = [classify(features(v[s:s+2*FS], h[s:s+2*FS])) for s in range(FS, len(acc)-2*FS, FS//2)]; return labels.count(label)/len(labels)`. Tests (collected by tests/run.py as `test_*`): test_still: frac('still','STILL')==1.0; test_walk: frac('walk','WALKING')>=0.95; test_walk_swing: frac('walk','WALKING',swing_deg=30)>=0.95; test_run: frac('run','RUNNING')>=0.95. Not a test_: `known_fail_run_asym()` computes f=frac('run','RUNNING',stride_asym=1.0) and prints `KNOWN-FAIL run stride_asym=1.0 {f:.2f}` if f<0.9 else `PASS run stride_asym=1.0 {f:.2f} -- rename to test_run_asym`. `__main__`: run the four tests printing `PASS <name>` (or `FAIL <name>` and exit 1), then known_fail_run_asym(), exit 0.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 tests/test_classify.py; echo exit=$? prints `PASS test_still`, `PASS test_walk`, `PASS test_walk_swing`, `PASS test_run`, then `KNOWN-FAIL run stride_asym=1.0 0.31` (17 of 54 windows with seed 7) and `exit=0`. After T28 the same command is expected to print `PASS run stride_asym=1.0 ...`; then rename the function to test_run_asym.",
+  "depends_on": [
+   "T01"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Fractions re-measured by the verifier for both seeds (scratchpad/verify-classify-ml/exp_thresholds.py): seed 7 still 54/54, walk 54/54, walk swing 54/54, run 54/54, run asym 17/54; seed 3 run asym 20/54. The original acceptance quoted the seed-3 number for a seed-7 test. A model-backed classify test belongs in T38, not here."
+ },
+ {
+  "id": "T32",
+  "title": "Tolerant folder-name parsing in build_dataset: skip bad names with a hint instead of crashing, normalise case and macOS copy suffixes",
+  "area": "classify-ml",
+  "files": [
+   "train.py"
+  ],
+  "problem": "train.py:55 `person, activity, placement = os.path.basename(folder).split('_')[:3]` raises `ValueError: not enough values to unpack (expected 3, got 2)` for `brett_still` (README.md:49 asks for a still recording without saying hand/pocket) and `(expected 3, got 1)` for any loose file such as data/notes.txt, because train.py:54 `glob.glob('data/*')` matches files. `Brett_Walk_Hand` creates a fourth class `Walk` silently, and a Finder duplicate `p1_walk_hand 2` creates a third placement: re-run by the verifier, train.py prints `placements: ['hand', 'hand 2', 'pocket']` and the leave-one-placement-out mean then includes a bogus fold.",
+  "change": "In train.py (after T07) add `def parse_name(folder)` returning `(person, activity, placement)` or None: `if not os.path.isdir(folder): return None`; `name = re.sub(r'\\s+\\d+$', '', os.path.basename(folder).strip().lower())` (strips the Finder ' 2' suffix); `parts = name.split('_')`; return None unless `len(parts) >= 3 and parts[1] in {'walk','run','still'} and parts[2] in {'hand','pocket'}`; otherwise return parts[:3]. In build_dataset replace line 55 with `meta = parse_name(folder); if meta is None: print(f'skipping {folder}: name it <person>_<walk|run|still>_<hand|pocket>, e.g. brett_still_hand'); continue; person, activity, placement = meta`. Add `import re`. A 2-part `brett_still` is skipped on purpose: accepting it with a placeholder placement would add a third leave-one-placement-out fold containing only still windows.",
+  "acceptance": "cd /home/user/qmind-step-detector && cp -r data_synth/p1_still_hand data_synth/brett_still && cp -r data_synth/p1_walk_hand data_synth/Brett_Walk_Hand && cp -r data_synth/p1_walk_hand 'data_synth/p1_walk_hand 2' && echo hi > data_synth/notes.txt && python3 train.py data_synth > /tmp/t32.txt; echo exit=$?; grep -c '^skipping' /tmp/t32.txt; grep windows /tmp/t32.txt; rm -rf data_synth/brett_still data_synth/Brett_Walk_Hand 'data_synth/p1_walk_hand 2' data_synth/notes.txt prints `exit=0`, then `2` (brett_still and notes.txt skipped, each with the rename hint), then `1084 windows from 5 people, placements: ['hand', 'pocket']` (976 + 54 for Brett_Walk_Hand + 54 for the ' 2' copy; no `Walk` class, no `hand 2` placement).",
+  "depends_on": [
+   "T07"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "brett_still / loose file / Capitalised crashes were executed by the ML lens (scratchpad/ml/crash.py); the macOS-suffix third-placement effect was re-run by the verifier. Window count: walk 30 s folder yields 54 windows (range(100, 2800, 50))."
+ },
+ {
+  "id": "T33",
+  "title": "Make train.load() fail clearly when CSVs are missing or malformed, and skip that folder",
+  "area": "classify-ml",
+  "files": [
+   "train.py"
+  ],
+  "problem": "train.py:23-36: when TotalAcceleration.csv and Accelerometer.csv are both absent, `read()` (train.py:24-26) returns None and train.py:30 `n = min(len(a), len(g))` raises `TypeError: object of type 'NoneType' has no len()` (re-run by the verifier with an empty folder: traceback, exit 1). Nothing checks that x,y,z columns exist (train.py:31,33) or that rows are finite, and the file lookup at train.py:25 is case-sensitive. Real iOS exports have header `time,seconds_elapsed,z,y,x` (scratchpad/facts-ios-sensorlogger.md), so reading by name is right; the column order must never be assumed.",
+  "change": "In load(): build `files = {os.path.basename(p).lower(): p for p in glob.glob(os.path.join(folder, '*.csv'))}` and look up 'totalacceleration.csv', 'accelerometer.csv', 'gravity.csv'. If neither totalacceleration nor (accelerometer and gravity) is present raise `FileNotFoundError(f'{folder}: need TotalAcceleration.csv or Accelerometer.csv + Gravity.csv')`. After reading, lower-case the column names and require {'x','y','z'} else raise `ValueError(f'{path}: columns {list(df.columns)} lack x,y,z')`. Drop non-finite rows with `acc = acc[np.isfinite(acc).all(axis=1)]` and raise `ValueError(f'{folder}: only {len(acc)} usable rows, need > {3*FS}')` when `len(acc) <= 3*FS` (windows() at train.py:43 yields nothing below that). In build_dataset wrap `load(folder)` in `try/except (FileNotFoundError, ValueError) as e: print('skipping', e); continue`.",
+  "acceptance": "cd /home/user/qmind-step-detector && mkdir -p data_synth/p9_walk_hand && printf 'x,y\\n1,2\\n' > data_synth/p8_run_pocket.csv && python3 train.py data_synth > /tmp/t33.txt; echo exit=$?; grep -c '^skipping' /tmp/t33.txt; grep -c 'need TotalAcceleration.csv' /tmp/t33.txt; grep -c 'Leave-one-placement-out' /tmp/t33.txt; rm -rf data_synth/p9_walk_hand data_synth/p8_run_pocket.csv prints `exit=0`, `2` (empty folder via FileNotFoundError, loose .csv via T32's parse_name), `1`, `1`, and the summary line still reads 976 windows.",
+  "depends_on": [
+   "T32"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Unit scaling at train.py:34-35 is left as is. evaluate.py (T09) benefits from the clearer errors. T32's isdir check is what produces the second 'skipping' line, hence the dependency."
+ },
+ {
+  "id": "T34",
+  "title": "train.py: report per-class confusion and per-fold accuracy instead of one mean accuracy; survive single-value splits",
+  "area": "classify-ml",
+  "files": [
+   "train.py"
+  ],
+  "problem": "train.py:71-73 prints only the mean of accuracy_score across folds. On the synthetic set that hides two different failure modes (re-measured by the verifier): A's 89% is 107 of 272 run windows predicted walk, all in the held-out-hand fold (hand 78%, pocket 100%); C's 94% is 61 of 432 walk windows predicted still, all in the held-out-pocket fold (hand 100%, pocket 88%). The pitch needs to say which class and which placement breaks. Also train.py:68-70 crashes with `ValueError: Found array with 0 sample(s) (shape=(0, 18))` when a split column has a single value (re-run with one person's six folders: exit 1), which is the normal state while the first person uploads.",
+  "change": "In evaluate() (T07): `from sklearn.metrics import confusion_matrix`; `LABELS = ['still','walk','run']`. For each split, if `df[split].nunique() < 2`: print `skipping leave-one-{split}-out: only one {split}` and continue. For each model accumulate `cm += confusion_matrix(y_true, y_pred, labels=LABELS)` over folds and keep `fold_acc[held] = f'{acc:.0%}'`. Print per model `  A  raw x/y/z  mean 89%  per-fold {'hand': '78%', 'pocket': '100%'}` followed by three rows `    true still | 272 0 0`, `    true walk  | ...`, `    true run   | ...` (columns = predicted still/walk/run). Keep the mean so existing numbers stay comparable; keep n_estimators=200.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 train.py data_synth prints, in the Leave-one-placement-out block, for A `per-fold {'hand': '78%', 'pocket': '100%'}` and a `true run` row `0 107 165`; for C `per-fold {'hand': '100%', 'pocket': '88%'}` and a `true walk` row `61 371 0`; every confusion table's rows sum to 272, 432, 272. Then: mkdir -p one && cp -r data_synth/p1_* one/ && python3 train.py one; echo exit=$?; rm -rf one prints a line `skipping leave-one-person-out: only one person`, a placement block, and `exit=0`.",
+  "depends_on": [
+   "T07"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The original task had A's per-fold dict reversed; the verifier's exp_train.py gives A hand 78% / pocket 100%, B 100/100 (one still window predicted walk), C and D hand 100% / pocket 88%. After T35, the 61-row table is labelled D and the 6-feature C shows 58."
+ },
+ {
+  "id": "T35",
+  "title": "Make A/B/C like-for-like: C as vertical-only (6 feats) and D as vertical+horizontal (7 feats)",
+  "area": "classify-ml",
+  "files": [
+   "train.py"
+  ],
+  "problem": "train.py:47-48 strip `h_std` from A and B but train.py:49 keeps it for C, so C has one extra information channel and a reader cannot tell whether C wins because of orientation or because of the extra feature. On synthetic data it does not matter (re-measured: C with h_std 94%, C without h_std 94%, 61 vs 58 walk-to-still errors), but it will be the first Q&A question. Worse, B (|a|) is itself orientation-invariant and scores 100% vs C's 94% under leave-one-placement-out, contradicting README.md:105. h_std is a placement fingerprint: median walk-hand h_std 1.40 vs walk-pocket 0.24 (verifier exp_model.py).",
+  "change": "In windows() (train.py:45-50) yield four dicts: A unchanged; B unchanged; `D = features(v[w], h[w])` (7 features); `C = {k: val for k, val in D.items() if k != 'h_std'}` (vertical only, 6 features, same keys as B minus the m_ prefix). Add D to the row dict in build_dataset and loop `for name in 'ABCD'` in evaluate() with labels {'A': 'raw x/y/z (18 feats)', 'B': 'magnitude only (6)', 'C': 'vertical only (6)', 'D': 'vertical + horizontal (7)'}. Print one legend line before the tables: `A vs B/C/D: does orientation-independence matter?  B vs C: does knowing the direction of motion help?  C vs D: does the horizontal channel help?`. Update the module docstring lines 7-10 to list the four.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 train.py data_synth | grep -E '^  [ABCD] ' prints 8 lines (four per split block) with the feature counts in parentheses; in the placement block B reads `mean 100%`, C `mean 94%`, D `mean 94%`, and the C confusion `true walk` row reads `58 374 0` while D's reads `61 371 0`.",
+  "depends_on": [
+   "T34"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "All numbers re-measured by the verifier (exp_train.py, 200 trees). Honest expectation for the pitch: on this simulator B >= C; T41 documents this. Depends on T34 to serialise evaluate() edits."
+ },
+ {
+  "id": "T36",
+  "title": "Add ablation.py: drop-one / add-one / single-feature accuracy for the D feature set and five candidate orientation-only features",
+  "area": "classify-ml",
+  "files": [
+   "ablation.py"
+  ],
+  "problem": "Nobody knows which of the seven steps.features keys (steps.py:33-39) carry placement information versus activity information. Verifier measurements under leave-one-placement-out (100 trees): the 7-feature D set scores 93.8%; adding all five candidate orientation-only features drops it to 78.4%; adding hv_ratio, vh_corr or v_band_frac alone each drops it to about 79% while h_cadence (93.2%) and v_skew (94.0%) are neutral; single-feature accuracy is v_std 100%, v_p2p 100%, cadence_hz 90%, h_std 42%. Dropping one base feature ranges from 75.7% (v_p2p) to 94.2% (e_walk_band), so the original claim that every drop stays within 3 points of 94% is false; the point is to measure, not guess.",
+  "change": "Create ablation.py: `from train import load, parse_name, windows as _unused` is not needed; import `load, parse_name, WIN` from train and `features, cadence_hz, spectrum` from steps, `gravity_lowpass, vertical_horizontal, FS` from orientation. `def extra_features(v, h)`: hv = h - h.mean(); return {'hv_ratio': h.std()/(v.std()+1e-6), 'h_cadence': cadence_hz(hv), 'vh_corr': np.corrcoef(v, hv)[0,1] if v.std()>1e-6 and hv.std()>1e-6 else 0.0, 'v_skew': ((v-v.mean())**3).mean()/(v.std()**3+1e-9), 'v_band_frac': E_v(1-4 Hz)/(E_v+E_h) using spectrum() amplitudes squared}. Loop folders like build_dataset (parse_name, load), compute v,h once per folder and for `s in range(FS, len(acc)-WIN, FS//2)` a row with activity, placement, `features(v[w],h[w])` merged with `extra_features(v[w],h[w])`. `def lopo(cols)`: mean accuracy over held-out placements with RandomForestClassifier(n_estimators=100, random_state=0). Print `D (7 base) acc: 94%`, then table 1 for the 7 base features: `feature drop_acc only_acc importance` (drop from the 7-set; importance averaged over the two 7-feature fold models), then table 2 for the 5 extras: `feature add_acc only_acc` (add = 7-set plus that one feature). Usage `python3 ablation.py <data_dir>`.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 ablation.py data_synth; echo exit=$? prints `D (7 base) acc: 94%`, a 7-row table and a 5-row table (12 feature rows) with numeric columns, and `exit=0`; in table 1 `only_acc` for v_std is 100% and for h_std is below 50% (measured 42%), `drop_acc` for h_std is 94% and for v_p2p is 76%; in table 2 `add_acc` for hv_ratio is below 85% (measured 79%) and for v_skew is at least 93%.",
+  "depends_on": [
+   "T32"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "All figures from scratchpad/verify-classify-ml/exp_ablation.py and exp_addone.py on the 24-folder fixture. Depends on T32 for parse_name (and T07 for importable load); it does not need T35's D column because it recomputes windows itself. Re-run on real data the moment it lands."
+ },
+ {
+  "id": "T37",
+  "title": "Save the trained D model with feature order and label map to model.joblib",
+  "area": "classify-ml",
+  "files": [
+   "train.py",
+   "requirements.txt"
+  ],
+  "problem": "train.py never persists a model: line 70 fits a RandomForest inside the fold loop and discards it, so README.md:91 'Swap the rule in steps.classify for the trained model' has nothing to swap in. The feature vector order is dict insertion order from steps.features (steps.py:33-39: cadence_hz, v_std, h_std, v_p2p, e_walk_band, e_run_band, e_high) flattened by `pd.DataFrame(list(df[name])).values` (train.py:66), and class labels are the folder strings (train.py:55; verified `classes_` is ['run','still','walk']); neither is recorded anywhere.",
+  "change": "Add `def save_model(df, path)` in train.py: `feature_names = list(df['D'].iloc[0].keys())`; `X = pd.DataFrame(list(df['D']))[feature_names].values`; fit `RandomForestClassifier(n_estimators=100, random_state=0)` on all rows; `joblib.dump({'model': m, 'features': feature_names, 'labels': {'still':'STILL','walk':'WALKING','run':'RUNNING'}, 'n_windows': len(df)}, path)`; print `saved {path}: {len(df)} windows, classes {sorted(m.classes_)}`. In the main guard: `args = [a for a in sys.argv[1:] if not a.startswith('--')]; data_dir = args[0] if args else <default data/>; save = ('--save' in sys.argv) or not args` so a plain `python3 train.py` (team data) always saves, while experimental runs on other directories (T34's `one/`, data_synth) do not overwrite model.joblib unless `--save` is passed. Default path `os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model.joblib')`. Add `joblib` to requirements.txt (it ships with scikit-learn; version 1.6.0 here).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 train.py data_synth --save | tail -1 && python3 -c \"import joblib; d=joblib.load('model.joblib'); print(sorted(d['model'].classes_), d['features'], d['labels']['run'], d['n_windows'])\" prints a line starting `saved ` and ending `976 windows, classes ['run', 'still', 'walk']`, then `['run', 'still', 'walk'] ['cadence_hz', 'v_std', 'h_std', 'v_p2p', 'e_walk_band', 'e_run_band', 'e_high'] RUNNING 976`. rm model.joblib && python3 train.py data_synth | grep -c '^saved' prints `0` (no save without --save on a non-default directory).",
+  "depends_on": [
+   "T35"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier re-ran the save (exp_model.py): 100 trees = 91 KB, single-row predict 5.9 ms. Size is M because it touches two files. Decide separately whether model.joblib is committed or git-ignored; a model trained only on synthetic data should not be the one the demo runs on real phones. T38's acceptance needs model.joblib present, so run this task's --save command first."
+ },
+ {
+  "id": "T38",
+  "title": "Load model.joblib in steps.classify with walk/run/still -> WALKING/RUNNING/STILL mapping and rule fallback",
+  "area": "classify-ml",
+  "files": [
+   "steps.py",
+   "tests/test_steps.py"
+  ],
+  "problem": "steps.classify (steps.py:42-46) is a hand rule returning 'STILL'/'RUNNING'/'WALKING'; server.py:45 calls it every poll, dashboard.html:14 styles exactly those three strings and dashboard.html:33-34 compare `s.state=='STILL'`. A trained model predicts 'walk'/'run'/'still' (verified), so dropping its output into state() would break the dashboard colours and the spm/cadence hiding, and detect_steps (steps.py:54-56) compares against 'STILL'/'RUNNING' so counting would silently use the walking gap for running. tests/test_steps.py test_classify (T04) passes partial feature dicts, which a model-backed classify cannot consume.",
+  "change": "In steps.py add `MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model.joblib')` and `_model = [None]`. `def load_model(path=MODEL_PATH)`: `import joblib` inside the function; if os.path.exists(path) set `_model[0] = joblib.load(path)` (the dict from T37) else `_model[0] = None`; wrap the import-time call in try/except Exception as e: print(f'steps: model not loaded ({e}); using rule') and never raise. Rename the current rule body to `classify_rule(feat)`. New `classify(feat)`: `d = _model[0]; if d is None: return classify_rule(feat)`; `x = np.array([[float(feat[k]) for k in d['features']]])`; `return d['labels'][str(d['model'].predict(x)[0])]`. Keep the signature so server.py:45 is untouched. In tests/test_steps.py change test_classify to import and call classify_rule, and add test_classify_model: skip (return) if steps._model[0] is None, else assert classify(full 7-key run dict) == 'RUNNING' and classify(full still dict) == 'STILL'.",
+  "acceptance": "With model.joblib present from T37's acceptance: cd /home/user/qmind-step-detector && python3 -c \"from steps import classify, classify_rule; f={'cadence_hz':3.0,'v_std':2.5,'h_std':0.3,'v_p2p':12,'e_walk_band':0.01,'e_run_band':0.6,'e_high':0.3}; print(classify(f), classify_rule(f))\" prints `RUNNING RUNNING`. Then mv model.joblib /tmp/m.bak && python3 -c \"from steps import classify; print(classify({'cadence_hz':1.0,'v_std':0.1,'h_std':0.1,'v_p2p':0.3,'e_walk_band':0.1,'e_run_band':0.1,'e_high':0.5}))\"; mv /tmp/m.bak model.joblib prints `STILL` with no traceback. python3 tests/test_steps.py; echo exit=$? ends with `exit=0`. Finally python3 -c \"import synth, server; a,t,*_=synth.make([('walk',60)]); st=set()\nfor i in range(0,len(a),20):\n    server.ingest([{'name':'totalacceleration','values':dict(zip('xyz',v))} for v in a[i:i+20]]); s=server.state()\n    if s.get('ready'): st.add(s['state'])\nprint(t, server.steps['count'], st)\" prints `108 108 {'WALKING'}`.",
+  "depends_on": [
+   "T37",
+   "T04"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Verifier checked with a model trained on the fixture: the run dict predicts 'run' -> RUNNING, the still dict 'still'; the replay without the ready filter collects None from the first 3 s (`{None, 'WALKING'}`), which is why the acceptance snippet filters on ready. Single-row predict 5.9 ms for 100 trees; the dashboard polls every 200 ms (dashboard.html:47). Keep classify_rule exported: T11 and T39 pin the rule. The synthetic-trained model labels the stride_asym=1.0 run correctly (54/54), so T11's KNOWN-FAIL applies to the rule only."
+ },
+ {
+  "id": "T39",
+  "title": "Add thresholds_report.py: data-driven check of the classify rule's 0.4 / 5 / 2.35 constants",
+  "area": "classify-ml",
+  "files": [
+   "thresholds_report.py"
+  ],
+  "problem": "steps.py:44-46 hard-codes `v_std < 0.4` => STILL and `cadence_hz > 2.35 or v_std > 5` => RUNNING. With 2 s windows at 100 Hz the FFT bins inside 1-4 Hz are exactly 1.0, 1.5, ..., 4.0 (steps.py:9, rfftfreq(200, 0.01)), so `> 2.35` is really `>= 2.5`. The `v_std > 5` fallback never fires on synthetic data (verifier: run v_std 5%-95% range 2.28-3.00, max 3.75 even with stride asymmetry 1.0), so when the half-frequency rule (steps.py:21-23) halves a run's cadence to 1.5 Hz, 80 of 114 windows of a 60 s asymmetric run become WALKING with v_std 3.67. Still v_std max 0.056 vs walk minimum 0.84, so 0.4 has a wide margin on synthetic; all real-phone values are Unverified.",
+  "change": "Create thresholds_report.py: `from train import build_dataset`; `import steps`; `rule = getattr(steps, 'classify_rule', steps.classify)`. `df = build_dataset(sys.argv[1])`; feature column `col = 'D' if 'D' in df else 'C'`; build a DataFrame from `df[col]` with activity and placement attached. Print per-activity quantiles (0, 5%, 50%, 95%, 100%) of v_std and cadence_hz. Print `rule accuracy overall: NN%` and `rule accuracy {still|walk|run}: NN%` using MAP={'still':'STILL','walk':'WALKING','run':'RUNNING'}. Fit `DecisionTreeClassifier(max_depth=2, random_state=0)` on [v_std, cadence_hz]; print `export_text(tree, feature_names=['v_std','cadence_hz'])` and its leave-one-placement-out accuracy. Usage `python3 thresholds_report.py <data_dir>`. Do not change steps.py.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 thresholds_report.py data_synth; echo exit=$? prints quantile rows for still/walk/run where still v_std max is below 0.1 (measured 0.056) and run v_std 50% is between 2 and 4 (measured 2.58), four lines `rule accuracy ...: 100%`, a tree block containing `v_std <=` (measured split at 0.45 then 1.67), a tree LOPO accuracy of 100%, and `exit=0`. Optional after T10: python3 make_fixtures.py --out data_hard --hard && python3 thresholds_report.py data_hard prints `rule accuracy run:` below 85% (measured 79%: 272 + 34 of 386 run windows) with the unmodified cadence_hz; expected to rise after T28.",
+  "depends_on": [
+   "T07"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "All distributions, the rule accuracy, the tree text and the --hard run accuracy re-measured by the verifier (exp_thresholds.py). Whether real running produces v_std > 5 is Unverified; this report answers it once data exists."
+ },
+ {
+  "id": "T08",
+  "title": "Add steps.count_steps(acc): one-pass offline counter that mirrors server.state()",
+  "area": "counting",
+  "files": [
+   "steps.py"
+  ],
+  "problem": "Step counting only exists inside the live server: server.py:47-50 runs detect_steps on the last 4 s of the 8 s ring buffer (server.py:12, maxlen=8*FS) each time GET /state is polled (server.py:67-69) and dedups by sample index (server.py:49). No function takes a whole recording and returns a count, so nothing offline can be compared with steps.txt (README.md:51, 92). Verified: a naive 'classify the last 2 s once, detect_steps once over the whole signal' gives 100 of 128 on a walk20/run20/walk20 recording because the WALKING min_gap of 0.4 s (steps.py:56) caps running; a windowed replay with a 1.0 s hop gives 135 of 167 on a stride-asymmetric run; a 0.2 s hop reproduces the live server count exactly on all 24 T02-style fixtures (880 counted vs 872 true in total) and on 4 extra cases (mixed 128, asym run 168, 3.2 Hz run 192, 1.4 Hz walk 92). Also verified: without a length guard the body raises IndexError in gravity_lowpass (orientation.py:15) on an empty array.",
+  "change": "Add to steps.py, after detect_steps: `from orientation import gravity_lowpass, vertical_horizontal` at the top next to the existing `from orientation import FS` (orientation.py imports nothing from steps, so no cycle). Then:\n```\ndef count_steps(acc, hop_s=0.2):\n    \"\"\"Offline twin of server.state() (after T12: server._count_locked()); keep the two in sync.\n    acc: (N,3) phone-frame acceleration, m/s^2 or g. Returns (count, states) where states is the\n    classify() label of every 2 s window stepped by hop_s.\"\"\"\n    acc = np.asarray(acc, float)\n    if len(acc) < 3 * FS:\n        return 0, []\n    if np.median(np.linalg.norm(acc, axis=1)) < 3:   # phone sent g units, mirror server.py:39-40\n        acc = acc * 9.81\n    g = gravity_lowpass(acc)\n    v, h, _ = vertical_horizontal(acc, g)\n    hop = int(hop_s * FS)\n    count, last, states = 0, -10 ** 9, []\n    for end in range(3 * FS, len(v) + 1, hop):\n        w = slice(end - 2 * FS, end)\n        feat = features(v[w], h[w])          # keep feat: T31 reads feat['cadence_hz'] here\n        st = classify(feat)\n        states.append(st)\n        lo = max(0, end - 4 * FS)\n        for p in detect_steps(v[lo:end], st):\n            gi = lo + p\n            if gi > last + 0.25 * FS and gi < end - 0.2 * FS:\n                count += 1; last = gi\n    return count, states\n```\nNo other file changes. Do not touch server.py here (T12/T31 own it).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import numpy as np, synth; from steps import count_steps; a,t,*_=synth.make([('walk',20),('run',20),('walk',20)],seed=99); print(count_steps(a)[0], t); a,t,*_=synth.make([('run',60)],seed=3,stride_asym=1.0); print(count_steps(a)[0], t); print(count_steps(np.zeros((0,3))), count_steps(a/9.81)[0])\" prints exactly `128 128`, then `168 167`, then `(0, []) 168`. (Verified these numbers are unchanged whether or not T28 or T31 has landed.)",
+  "depends_on": [
+   "T01"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Re-verified by this verifier in scratchpad/verify-counting/t08_check.py: a literal implementation of the change matches the live server replay (harness-style, 0.2 s packets) on every one of the 24 fixture cases and 4 extras, and the acceptance numbers are identical under base, T28-cadence, T31 and T28+T31 variants. Hop sensitivity on the asymmetric run: hop 0.1/0.2 -> 168, hop 0.5 -> 133, hop 1.0 -> 135; keep the 0.2 s default. T31 adds a min_gap_s argument to the detect_steps call inside this loop, hence the `feat` variable."
+ },
+ {
+  "id": "T31",
+  "title": "Derive the step min-gap from cadence instead of the WALKING/RUNNING label",
+  "area": "counting",
+  "files": [
+   "steps.py",
+   "server.py"
+  ],
+  "problem": "detect_steps sets min_gap = 0.4 s for anything that is not RUNNING (steps.py:56), which caps counting at 2.5 steps/s, and server.py:47 passes the classifier label in. When the classifier is wrong the count is capped: verified live via a harness replay, a 3.2 Hz run with classify forced to WALKING counts 153 of 192 (-20%); a one-pass detect_steps(v,'WALKING') over a 2.8 Hz run gives 84 of 167. The misclassification is real on synthetic data: a 2.8 Hz run with stride_asym=1.0 (seed=3) has 201 of 286 windows labelled WALKING by classify (steps.py:46) because the half-frequency rule (steps.py:21-23) reads 1.5 Hz. Verified fix: min_gap = clip(0.6/cadence_hz, 0.2, 0.45) s gives 192/192 on the forced-WALKING 3.2 Hz run and 168/167 on the asymmetric run, leaves 1.8 Hz walking at 108/108, and moves the 1.4 Hz slow walk from 92 to 94 (true 83). Note the overlapping 4 s windows in the live/count_steps path already recover 168/167 on the 2.8 Hz asymmetric run even with the WALKING gap, so the capped case that matters is faster running (3.2 Hz) or sparser polling (hop 0.5 s -> 133/167).",
+  "change": "steps.py: (1) change the signature to `def detect_steps(vertical, state, min_gap_s=None):` and replace steps.py:56 with `min_gap = int(FS * (0.28 if state == \"RUNNING\" else 0.4)) if min_gap_s is None else int(FS * min_gap_s)`; the STILL early return and the threshold stay as they are. (2) Add `def gap_from_cadence(c):\\n    \"\"\"Min gap between two steps, s: 60% of one step period, clipped to 0.2-0.45 s.\"\"\"\\n    return float(np.clip(0.6 / max(c, 1e-6), 0.2, 0.45))`. (3) In count_steps (T08) change the call to `detect_steps(v[lo:end], st, min_gap_s=gap_from_cadence(feat['cadence_hz']))`. server.py: add gap_from_cadence to the `from steps import ...` line (server.py:8) and, in the counting site (server.py:47 today; `_count_locked()` once T12 has landed), call `detect_steps(vert[-4 * FS:], st, min_gap_s=gap_from_cadence(feat['cadence_hz']))`. The counting code must keep looking up `classify` as a server-module global (as server.py:8/45 do now) so the acceptance monkeypatch works. Leave train.py untouched (train.py:18 imports only features).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import synth, server, importlib\ndef live(a, force=None):\n    importlib.reload(server)\n    if force: server.classify = lambda feat: force\n    s = None\n    for i in range(0, len(a), 20): server.ingest([{'name':'totalacceleration','values':dict(zip('xyz',v))} for v in a[i:i+20]]); s = server.state()\n    return s['steps']\nprint(live(synth.make([('run',60)], f_run=3.2, amp_run=9.0)[0], force='WALKING'), live(synth.make([('walk',60)], f_walk=1.4, amp_walk=2.0)[0]))\" prints `192 94` (pass band: first number in 186..198, i.e. within 3% of 192, currently 153; second number <= 95, true 83, currently 92; verified 192 94 without T28 and 192 93 with T28). Then python3 -c \"import synth, steps; print([round(steps.gap_from_cadence(c),3) for c in (3.2,1.5,0.0)]); a,t,*_=synth.make([('run',60)],seed=3,stride_asym=1.0); print(steps.count_steps(a)[0], t)\" prints `[0.2, 0.4, 0.45]` then `168 167`. If tests/test_steps.py exists (T04), `python3 tests/test_steps.py` must still print ok (its detect_steps asserts use the default min_gap_s=None path; verified).",
+  "depends_on": [
+   "T08",
+   "T12"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "All numbers reproduced by this verifier in scratchpad/verify-counting/t31_accept.py on a patched copy (variants t31_base, t31_t28). T30 was removed from depends_on and dropped: with T30's mean-subtraction applied first, the slow-walk acceptance number becomes 96 and fails the <= 95 gate (verified in variant t31_t30). Caveat (Verified): when the half-frequency rule halves the running cadence to 1.5 Hz the gap is 0.4 s again, so with sparse polling the asymmetric run still loses steps (hop 0.5 s -> 133/167 even with this change); T28 is the fix on that side. The reference to `_count_locked()` assumes T12 creates that helper (Inference: T12's text was not available to this verifier); if T12 names it differently, apply the same one-line change wherever detect_steps is called in server.py."
+ },
+ {
+  "id": "T12",
+  "title": "Count steps inside ingest(), not only on GET /state; add server.reset_state() and a shared _analyse() helper",
+  "area": "server-demo",
+  "files": [
+   "server.py"
+  ],
+  "problem": "steps['count'] is only incremented inside state() (server.py:47-50; the /reset handler at server.py:76 only zeroes it), and state() runs only when the dashboard polls GET /state (server.py:67-69; dashboard.html:47 polls every 200 ms). A closed or background-throttled tab therefore loses steps. Reproduced on the unmodified server with scratchpad/verify-server-demo/baseline.py: 60 s synthetic walk ingested with no polling then one state() -> 7 of 108; ingest only, no state() -> 0; polled every 5 s -> 84; every 0.2 s -> 108. The module globals at server.py:12-15 have no reset function, so T13/T14/T15 would each have to hand-reset them.",
+  "change": "In server.py: (1) add `def _analyse(b)` that takes the buffer copy (np.array of rows [sample_no, x, y, z]) and returns None when len(b) < 3*FS, else the tuple (idx, acc, vert, horiz, down, feat, st) using exactly the current lines 38-45 (idx/acc split, the <3 -> *9.81 g-unit rescale, gravity_lowpass, vertical_horizontal, features on the last 2 s, classify). (2) add `def _count_locked()` that assumes `lock` is held: `b = np.array(buf)`; r = _analyse(b); if r is None return; then the detect_steps loop of lines 47-50 unchanged, updating `steps`. (3) add `last_counted = [0]`; in ingest(), right after `buf.append(...)` (server.py:30, inside the `with lock:` of line 20) add `if n_seen[0] - last_counted[0] >= FS // 5: last_counted[0] = n_seen[0]; _count_locked()`. (4) make state() read-only: under lock copy `b`, call _analyse(b), return {'ready': False} when None, else build the same JSON as today (keys unchanged: ready, state, steps, cadence, spm, down, tilt, freqs, amp, vertical) without touching `steps`. (5) add `def reset_state():` that under `lock` does buf.clear(); n_seen[0] = 0; grav[0] = None; last_counted[0] = 0; steps.update(count=0, last=-10**9). Leave the /reset handler (server.py:76) as count-only. Later server tasks (T16, T17, T18, T24, T26, T27) add their own globals to reset_state() and edit _analyse() in one place.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import synth, server; a,t,*_=synth.make([('walk',60)]); server.ingest([{'name':'totalacceleration','values':dict(zip('xyz',v))} for v in a]); print(t, server.steps['count']); server.reset_state(); print(server.steps['count'], len(server.buf))\" prints `108 108` (before the change `108 0`) then `0 0`. Also python3 -c \"import synth, server; a,t,*_=synth.make([('walk',60)])\nfor i in range(0,len(a),500):\n    server.ingest([{'name':'totalacceleration','values':dict(zip('xyz',v))} for v in a[i:i+500]]); server.state()\nprint(t, server.steps['count'])\" prints `108 108` (5 s packets; currently prints `108 84`). Both results were reproduced on the patched scratch copy scratchpad/verify-server-demo/patched/server.py.",
+  "depends_on": [
+   "T01"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The shared _analyse() helper is added here (not in the original task text) so that T18 (resampling) and T24 (gyro gravity) edit one place instead of two; without it state() and _count_locked() would duplicate lines 38-45. Counting every 20 samples inside ingest is exactly what the 0.2 s poll did, so the count equals the 0.2 s-polled count regardless of packet size (verified: 20-sample and 500-sample packets both give 108). state() costs ~2.2 ms (scratchpad/demo/exp3.py), so this is ~1% CPU. `lock` is a plain threading.Lock, so _count_locked() must never re-acquire it."
+ },
+ {
+  "id": "T13",
+  "title": "Add tests/test_server.py: in-process smoke test of server.ingest/state with synthetic gait",
+  "area": "server-demo",
+  "files": [
+   "tests/test_server.py"
+  ],
+  "problem": "server.py's live path (ingest at server.py:19-30, state at server.py:33-56, including the iOS accelerometer+gravity merge at server.py:27-28 and the g-unit rescale at server.py:39-40) can only be exercised today by running simulate.py against a live HTTP server and reading the dashboard by eye. The counter state is module globals (server.py:12-15) so a test must reset them explicitly.",
+  "change": "Create tests/test_server.py (plain asserts; `sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))`). Call `server.reset_state()` (T12) at the start of every test. Helper `replay(acc, stream='totalacceleration', poll=20)`: for i in range(0, len(acc), poll): server.ingest([{'name': stream, 'values': dict(zip('xyz', map(float, v)))} for v in acc[i:i+poll]]); s = server.state(); collect s['state'] when s['ready']; return server.steps['count'], states. test_not_ready_before_3s: acc = synth.make([('walk', 5)])[0]; replay(acc[:250]) and assert every state() call returned `s['ready'] is False` (check only the `ready` key: T17 and T27 add `fs_measured` and `age_s` to the not-ready dict). test_walk_count: acc, true, *_ = synth.make([('walk', 30)], seed=5); n, st = replay(acc); assert abs(n - true) / true <= 0.03 and set(st) == {'WALKING'}. test_ios_streams: g = [0.0, 0.0, 9.81]; per sample send [{'name': 'gravity', 'values': {x,y,z of g}}, {'name': 'accelerometer', 'values': {x,y,z of acc[i]-g}}] in 20-sample packets with state() after each; assert server.steps['count'] == the n from test_walk_count (54). test_state_keys: after a 30 s replay the last state() has at least keys {'ready','state','steps','cadence','spm','down','tilt','freqs','amp','vertical'}. Runner: `if __name__ == '__main__': [f() for n, f in sorted(globals().items()) if n.startswith('test_')]; print('ok')`.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 tests/test_server.py; echo exit=$? prints `ok` and `exit=0`. Expected internals (reproduced on the unmodified server and on the patched copy): walk 30 s seed 5 -> 54 counted of 54 true via both the totalacceleration path and the accelerometer+gravity path, all 136 ready windows WALKING; the first 13 state() calls (250 samples) all have ready False.",
+  "depends_on": [
+   "T01",
+   "T12"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "scratchpad/verify-server-demo/baseline.py and accept.py ran this exact sequence. After T12 the count comes from ingest-side counting, which equals the 0.2 s-polled count. Do not assert dict equality on the not-ready response."
+ },
+ {
+  "id": "T14",
+  "title": "Add tests/test_server_http.py: HTTP smoke test of server.H on a free port (/data, /state, /reset, /)",
+  "area": "server-demo",
+  "files": [
+   "tests/test_server_http.py"
+  ],
+  "problem": "The HTTP handler (server.py:59-81) is only run via `python3 server.py` on hardcoded port 8000 (server.py:11,88). do_POST swallows bad JSON with a print (server.py:77-80), /reset only resets count (server.py:76), and GET / serves dashboard.html relative to __file__ (server.py:71). None of this is covered by a test.",
+  "change": "Create tests/test_server_http.py. Start `srv = ThreadingHTTPServer(('127.0.0.1', 0), server.H)` in a daemon thread; port = srv.server_address[1]; helpers get(path) -> parsed JSON via urllib.request.urlopen, post(path, body: bytes) -> HTTP status via urllib.request.Request(method='POST'). Call server.reset_state() (T12) first. Steps: (1) get('/state')['ready'] is False. (2) acc, true, *_ = synth.make([('walk', 30)], seed=5); for i in range(0, len(acc), 20): post('/data', json.dumps({'payload': [{'name': 'totalacceleration', 'values': {x,y,z}} ...]}).encode()) then s = get('/state'); final s: s['ready'] is True, s['state'] == 'WALKING', abs(s['steps'] - true) / true <= 0.03. (3) post('/reset', b'') returns 200 and get('/state')['steps'] == 0. (4) urllib.request.urlopen(base + '/').read() starts with b'<!doctype html>'. (5) post('/data', b'not json') returns 200 and a following get('/state')['ready'] is True. srv.shutdown() at the end. Same `__main__` runner as T13.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 tests/test_server_http.py; echo exit=$? prints one `bad packet: Expecting value: line 1 column 1 (char 0)` line from the in-process server (do_POST prints to stdout), then `ok`, and `exit=0`.",
+  "depends_on": [
+   "T01",
+   "T12"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "scratchpad/verify-server-demo/http_smoke.py ran this exact sequence on the unmodified server: ready False -> after the 30 s walk steps 54 (true 54), WALKING, spm 120; /reset -> 0; GET / returns 3962 bytes starting with <!doctype html>; non-JSON POST prints the bad-packet line and the server keeps serving. Also observed (not a task): GET /anything serves the dashboard and POST /anything-but-reset is treated as /data."
+ },
+ {
+  "id": "T15",
+  "title": "evaluate.py --live: replay each recording through server.ingest at a chosen packet interval",
+  "area": "server-demo",
+  "files": [
+   "evaluate.py"
+  ],
+  "problem": "Before T12 the live demo counted steps only when GET /state was called (server.py:47-50 inside state(), called from do_GET at server.py:67-69; dashboard.html:47 polls every 200 ms): on fixture p1_walk_hand (walk 30 s, seed 1, 30 deg swing) a 5 s poll counts 42 of 54, a 0.2 s poll 54 of 54 (scratchpad/verify-server-demo/baseline.py). evaluate.py (T09) measures only the offline count_steps path, so the live path is never held to the 3% target and a regression of T12 would go unnoticed.",
+  "change": "In evaluate.py add `--live` (store_true) and `--poll-s` (float, default 0.2, the packet interval). When --live is set, for each recording also run: import server; server.reset_state(); for i in range(0, len(acc), int(poll_s * FS)): server.ingest([{'name': 'totalacceleration', 'values': {'x': float(v[0]), 'y': float(v[1]), 'z': float(v[2])}} for v in acc[i:i+step]]); server.state(); live = server.steps['count']. Add a column `live={live:4d}` to each row and a `live overall: true=<T> counted=<C> err=<pct>` line with its own error percentage. Reuse the row formatting from T09; about 20 added lines. Exit code stays based on the offline count.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 evaluate.py --data data_synth --live | tail -2 shows a `live overall: true=872 counted=<C>` line with C within 3% of 872 (846..898; expected 880, the same as the offline line if T08's count_steps mirrors the 0.2 s-hop live counter exactly), and python3 evaluate.py --data data_synth --live --poll-s 5 | grep p1_walk_hand shows `counted=  54` and `live=  54` (with T12 merged; on the pre-T12 server this reads live=  42, the regression this guards).",
+  "depends_on": [
+   "T09",
+   "T12"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Poll-rate loss (42 vs 54 on p1_walk_hand at 5 s) and the fixture totals (true 872, windowed count 880, scratchpad/verify-fixtures-eval/check_counts.py) are Verified. That the live count equals the offline count exactly for every recording is an Inference from T08's design; the acceptance therefore gates on the 3% band, not on equality. After T12, --poll-s only changes packet size; the ingest-side counter runs every 20 samples regardless, which is what makes live=54 at 5 s."
+ },
+ {
+  "id": "T16",
+  "title": "Ingest exactly one acceleration stream, never both",
+  "area": "server-demo",
+  "files": [
+   "server.py"
+  ],
+  "problem": "ingest() appends a sample for every entry named `totalacceleration` OR `accelerometer` (server.py:26-30). If a phone streams both, each instant lands in buf twice. Reproduced (scratchpad/verify-server-demo/baseline.py): 60 s walk sent as both names -> n_seen=12000, the 8 s buffer covers 4 s, reported cadence 1.0 Hz instead of 2.0 (spm 60 instead of 120); the count stayed 108 only because duplicate neighbours defeat the strict `>` peak test at steps.py:60. Sensor Logger exposes Accelerometer (gravity removed) and TotalAcceleration as two separate Android sensors (scratchpad/sl/UNITS.md:18-19), so both can be enabled; on iOS only `accelerometer`+`gravity` exist, so this cannot happen on the all-iPhone team's phones (decisions.md item 4).",
+  "change": "server.py: add `src = [None]`. In ingest(), at the top of the `elif name in ('totalacceleration', 'accelerometer')` branch: `if src[0] is None or (name == 'totalacceleration' and src[0] == 'accelerometer'): src[0] = name; buf.clear()` (prefer the stream that already includes gravity; T17 adds tbuf.clear() here); then `if name != src[0]: continue`. Do NOT reset n_seen, last_counted or steps['last'] on the switch: n_seen stays monotonic so the index dedup at server.py:49 keeps working. Add `src[0] = None` to reset_state() (T12) only; leave the /reset handler untouched.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import synth, server; a,t,*_=synth.make([('walk',60)])\nfor i in range(0,len(a),20):\n    pl=[]\n    for v in a[i:i+20]: pl += [{'name':'accelerometer','values':dict(zip('xyz',v))},{'name':'totalacceleration','values':dict(zip('xyz',v))}]\n    server.ingest(pl); s=server.state()\nprint(server.n_seen[0], s['cadence'], server.steps['count'])\" prints `6001 2.0 108` (the one accelerometer sample accepted before the first totalacceleration entry stays counted; currently prints `12000 1.0 108`; after T28 the cadence prints about 1.81).",
+  "depends_on": [
+   "T12"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Reproduced on the patched copy: 6001 2.0 108, and a stream switch at 30 s (accelerometer -> totalacceleration) counts 54 then 108 of 108. The original text reset n_seen to 0 on the switch and reset src in /reset: with steps['last'] left at its old value (e.g. 2948) the dedup `gi > steps['last'] + 25` at server.py:49 would then reject every step for ~30 s, and resetting src on /reset would clear the live buffer on the next packet, blanking the dashboard for 3 s (Inference, traced not run). The real-world trigger is Android-only; the task is kept because the code path is reachable and T17 hooks into the same branch."
+ },
+ {
+  "id": "T17",
+  "title": "Measure the real sample rate from packet timestamps",
+  "area": "server-demo",
+  "files": [
+   "server.py"
+  ],
+  "problem": "ingest() reads only name/values (server.py:21-30) and never the per-sample `time` field; everything downstream assumes FS=100 (orientation.py:7, steps.py:9, server.py:36,43,47). Reproduced (scratchpad/verify-server-demo/baseline.py): a phone sending 50 Hz makes a 60 s walk read RUNNING in 271/271 windows at cadence 3.5 Hz and counts 82 of 108 steps. Sensor Logger documents `time` as UTC epoch nanoseconds on every payload entry (scratchpad/sl/PUSHING.md:38, sl/UNITS.md:9) and warns sampling is never perfectly even.",
+  "change": "server.py: add `tbuf = collections.deque(maxlen=8 * FS)` next to buf. In ingest(), for each accepted acceleration sample read `t = p.get('time')` and append `None if t is None else t / 1e9` to tbuf (always nanoseconds; no unit guessing). Add `def measured_fs()`: `ts = [t for t in tbuf if t is not None]`; return None if len(ts) < 2 * FS, else `(len(ts) - 1) / (ts[-1] - ts[0])`. state() returns an extra key `fs_measured` (float or None) in both the ready and not-ready dicts. In state(), if fs_measured is not None and abs(fs_measured - FS) / FS > 0.1, print once (module flag `_warned = [False]`) `WARNING: phone sends {fs:.0f} Hz, server assumes {FS} Hz -- set Sensor Logger to 100 Hz`. Clear tbuf in reset_state() and in the T16 `buf.clear()` on stream switch.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import server; server.ingest([{'name':'totalacceleration','time':i*20_000_000,'values':{'x':0,'y':0,'z':9.81}} for i in range(400)]); print(round(server.measured_fs(),1)); server.reset_state(); server.ingest([{'name':'totalacceleration','values':{'x':0,'y':0,'z':9.81}} for i in range(400)]); print(server.measured_fs())\" prints `50.0` then `None`. Real epoch-ns input (1698501144401773000 + i*10_000_000 for 400 samples) gives 100.0.",
+  "depends_on": [
+   "T16"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The original ns/ms/s heuristic (`t > 1e12` -> ns, `t > 1e9` -> ms) was refuted: epoch milliseconds (~1.7e12) exceed 1e12 and would be read as ns, and the acceptance's own input 0..7.98e9 would be split between the seconds and milliseconds branches, so measured_fs would not print 50.0. Nanoseconds are documented, so parse as ns only. All three acceptance numbers were reproduced on the patched copy."
+ },
+ {
+  "id": "T18",
+  "title": "Resample the buffer to 100 Hz when the measured rate differs, with a time-based sample index",
+  "area": "server-demo",
+  "files": [
+   "server.py"
+  ],
+  "problem": "Even with T17 reporting the true rate, _analyse() still processes the buffer as if it were 100 Hz (server.py:36-50 today). Reproduced: 50 Hz walk feed -> 82/108 steps, always RUNNING, cadence 3.5 Hz. The step dedup at server.py:49 (`gi > steps['last'] + 0.25 * FS`, `gi < idx[-1] - 0.2 * FS`) is in sample-index units, so any resampling must also convert the index to 100 Hz units: interpolating the raw sample-number column (the first draft of this task) leaves the index in 50 Hz units, which passes a walk (108/108) but drops a 50 Hz run to 84 of 167 steps because the 25-unit gap then means 0.5 s (scratchpad/verify-server-demo/t18_variant.py).",
+  "change": "server.py: add `t0 = [None]` (first timestamp seen, seconds) set in ingest() when the first non-None time arrives; reset in reset_state(). Add `def _resampled(b, ts)` returning `(idx, acc)`: if len(b) == 0 or any t is None -> `(b[:, 0].astype(int), b[:, 1:])`; else `t = np.array(ts, float)`, `fs = measured_fs()`; if fs is None or abs(fs - FS) / FS <= 0.05 or np.any(np.diff(t) <= 0) -> same raw return; else `grid = np.arange(t[0], t[-1], 1 / FS)`, `acc = np.stack([np.interp(grid, t, b[:, k]) for k in (1, 2, 3)], axis=1)`, `idx = np.round((grid - t0[0]) * FS).astype(int)`. In `_analyse(b)` (T12) replace the `idx, acc = b[:, 0].astype(int), b[:, 1:]` line with `idx, acc = _resampled(b, ts)` and apply the `len(acc) < 3 * FS` readiness check after resampling; `ts = list(tbuf)` must be copied under the same lock as `b` (pass it in from _count_locked() and state()).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import synth, server; from collections import Counter; st=[]\nfor mode in ('walk','run'):\n    server.reset_state(); a,t,*_=synth.make([(mode,60)]); a=a[::2]; st=[]\n    for i in range(0,len(a),10):\n        server.ingest([{'name':'totalacceleration','time':int((i+j)*20_000_000),'values':dict(zip('xyz',v))} for j,v in enumerate(a[i:i+10])]); s=server.state(); st.append(s.get('state'))\n    print(mode, t, server.steps['count'], Counter(st).most_common(1)[0][0])\" prints `walk 108 <n> WALKING` with n in 105..111 and `run 167 <m> RUNNING` with m in 162..172, preceded by one WARNING line from T17 (currently `walk 108 82 RUNNING`). Patched copy gives walk 108 and run 168.",
+  "depends_on": [
+   "T17"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Anchoring the index at the buffer's first raw index instead of a fixed t0 was also traced and rejected: a counted step's index would drift by one unit per raw sample between calls, so the next step at 0.36 s would fall inside the dedup gap. A 100 Hz feed with timestamps (no interpolation) still counts 108/108 on the patched copy. Out-of-order packets (messageId exists for that, sl/PUSHING.md:33) make t non-monotonic; the np.diff guard then skips resampling rather than crashing np.interp."
+ },
+ {
+  "id": "T19",
+  "title": "Print a LAN address the phone can reach, not 127.0.0.1",
+  "area": "server-demo",
+  "files": [
+   "server.py"
+  ],
+  "problem": "server.py:85 uses socket.gethostbyname(socket.gethostname()) for the push URL students paste into Sensor Logger (README.md:40, README.md:99). Reproduced in this environment: it returns 127.0.0.1 while the UDP-connect trick returns the routable 192.0.2.2 (scratchpad/verify-server-demo/baseline.py). On macOS laptops gethostbyname of the hostname commonly fails or resolves to loopback too (Inference).",
+  "change": "server.py: add `def local_ip():` that opens `socket.socket(socket.AF_INET, socket.SOCK_DGRAM)`, calls `connect(('10.255.255.255', 1))` and returns `getsockname()[0]`; on any exception falls back to `socket.gethostbyname(socket.gethostname())`; closes the socket in a `finally`. In `__main__` use `ip = local_ip()`; if `ip.startswith('127.')` also print `Could not find your hotspot IP -- run ifconfig / ipconfig and use the 192.168.x.x or 172.20.x.x address instead.`",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import server; ip=server.local_ip(); print(ip); assert not ip.startswith('127.'), ip\" prints a non-loopback address (here `192.0.2.2`) and exits 0; python3 -c \"import socket; print(socket.gethostbyname(socket.gethostname()))\" prints `127.0.0.1` for comparison.",
+  "depends_on": [],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "No packets are sent by the UDP connect; it only asks the OS which interface would route to that address. Touches only the __main__ block so it does not conflict with the ingest/state chain. 172.20.10.x is the iPhone personal-hotspot range."
+ },
+ {
+  "id": "T20",
+  "title": "Make simulate.py importable: sample() generator function plus main guard",
+  "area": "server-demo",
+  "files": [
+   "simulate.py"
+  ],
+  "problem": "simulate.py runs its infinite HTTP loop at module level (simulate.py:13-26) so nothing can import or test its generator; the scratchpad harness had to copy it (harness.py:7-30). Reproduced: `timeout 10 python3 -c 'import simulate' < /dev/null` exits 1 with `URLError: Connection refused` from simulate.py:23 (it does not block), and its toggle thread (simulate.py:8-11) raises EOFError when stdin is not a terminal. Its docstring says it 'Prints the true step count' (simulate.py:2) but it only writes `.true_steps` (simulate.py:25).",
+  "change": "simulate.py: define `def sample(mode, phase, rng, asym=0.0, jitter=0.0)` that advances one 1/FS tick and returns `(world, phase, stepped)` where `world` is the 3-vector of simulate.py:17-20 (before rotation, noise drawn from `rng.normal(0, 0.25, 3)`) and `stepped` is True when `int(phase)` increased; `asym`/`jitter` are accepted but unused in this task (defaults keep the exact current signal). Put the toggle thread, the rotation `R` (drawn from `rng`), the HTTP posting loop and the `.true_steps` write inside `def main(url='http://localhost:8000/data'):` under `if __name__ == '__main__': main()`. Additionally print `true steps: {true_steps}` to stderr each second next to the `.true_steps` write. Use `rng = np.random.default_rng()`.",
+  "acceptance": "cd /home/user/qmind-step-detector && timeout 10 python3 -c \"import numpy as np, simulate; rng=np.random.default_rng(0); w,ph,st=simulate.sample('walk',0.0,rng); print(w.shape, round(ph,3), st); w,ph,st=simulate.sample('run',0.99,rng); print(round(ph,3), st)\" < /dev/null prints `(3,) 0.018 False` then `1.018 True` and exits 0 (currently exits 1 with URLError: Connection refused, plus an EOFError traceback from the toggle thread).",
+  "depends_on": [],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Expected sample() values reproduced with the simulate.py maths in scratchpad/verify-server-demo/baseline.py. Keep the behaviour of `python3 simulate.py` identical for students: walk by default, Enter toggles, posts to localhost:8000."
+ },
+ {
+  "id": "T21",
+  "title": "Harder simulator: cadence jitter, stride asymmetry, mid-run re-orientation, offline mode",
+  "area": "server-demo",
+  "files": [
+   "simulate.py"
+  ],
+  "problem": "The simulator is too easy: one fixed random rotation R for the whole run (simulate.py:6), perfectly periodic cadence (simulate.py:14-15), identical spike height every step (simulate.py:18). The outline reports 108/108 and 168/167 on it, which cannot be trusted to transfer; stride asymmetry alone flips 204/286 running windows to WALKING (outline section 3, Verified on the harness copy of this generator).",
+  "change": "simulate.py (building on T20's `sample()` and `main()`): implement `asym` (every other step's spike amplitude multiplied by `1 + asym`, i.e. `a = amp * (1 + asym * (int(phase) % 2))`) and `jitter` (at each new step draw `f_step = f * rng.normal(1, jitter)` and use it until the next step; keep the drawn value in a mutable argument or return it so sample() stays stateless). Add argparse to main: `--asym` (float, default 0), `--jitter` (float, default 0), `--reorient-every` (seconds, default 0 = never; when > 0 draw a new `R` via `np.linalg.qr(rng.normal(size=(3,3)))[0]` every that many seconds and print `re-oriented` to stderr), `--seconds N` (offline: generate N seconds without HTTP and without starting the toggle thread, print `true steps: N` to stdout and exit 0), `--url` (default http://localhost:8000/data).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 simulate.py --seconds 60 < /dev/null | tail -1; python3 simulate.py --seconds 60 --asym 1 --jitter 0.1 --reorient-every 10 2>/dev/null < /dev/null | tail -1 prints exactly `true steps: 108` then `true steps: <n>` with n in 98..118, both exiting 0 with no network access and no traceback on stderr for the first command.",
+  "depends_on": [
+   "T20"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The jitter rule as specified was run for 20 seeds in scratchpad/verify-server-demo/t24_t21.py: true steps 104..108 (mean 106.3), so 98..118 is safe; no-jitter 60 s walk gives exactly 108 with simulate.py's accumulation. The toggle thread must be skipped in --seconds mode because `iter(input, None)` raises EOFError when stdin is not a terminal (observed). synth.py (T01) already has stride_asym and swing_deg for offline tests; this task is for the live demo."
+ },
+ {
+  "id": "T24",
+  "title": "server: ingest the gyroscope stream and use gravity_complementary when present, aligned by sample number",
+  "area": "server-demo",
+  "files": [
+   "server.py"
+  ],
+  "problem": "server.ingest (server.py:24-30) keeps only 'gravity', 'totalacceleration' and 'accelerometer'; a 'gyroscope' packet is silently dropped, and state() (server.py:41) always calls gravity_lowpass. README.md:32 tells users to enable Gyroscope and README.md:89 asks the Orientation pair whether the gyro version is steadier, but it cannot be exercised live. On a synthetic 30 deg arm-swing walk the live lowpass down direction is 18.65 deg off on average (max 29.5) versus 0.42 deg for gravity_complementary(k=0.995) recomputed over the 8 s buffer (scratchpad/verify-server-demo/baseline.py). Aligning gyro to acc by trailing count (`gyr[-len(b):]`) was refuted: a packet carries the 20 acc entries before its 20 gyro entries, so the ingest-side counter (T12) runs with the gyro 0.2 s stale and double-counts (56 of 54 steps on every seed) while state() after the packet looks fine.",
+  "change": "server.py: add `gyr = collections.deque(maxlen=8 * FS)` and `n_gyr = [0]` next to buf; in ingest add `elif name == 'gyroscope': n_gyr[0] = n_gyr[0] + 1 if n_gyr[0] else n_seen[0] + 1; gyr.append([n_gyr[0], *xyz])` (the gyro counter starts at the current acc count so a gyro stream that starts late still aligns). Clear both in reset_state(). Add `def _gravity(acc, b, gyr_arr)`: if len(gyr_arr): `i0, i1 = int(b[0, 0]), int(b[-1, 0])`; `n = gyr_arr[:, 0].astype(int)`; `sel = (n >= i0) & (n <= i1)`; if `sel.sum() >= len(b) - FS // 5 and len(acc) == len(b)` (gyro may lag by one packet; skip when T18 resampled): `gy = np.zeros((len(b), 3)); gy[n[sel] - i0] = gyr_arr[sel, 1:]`; if `np.median(np.linalg.norm(gy, axis=1)) > 20: gy = np.radians(gy)`; return `gravity_complementary(acc, gy, k=0.995), 'gyro'`; otherwise return `gravity_lowpass(acc), 'lowpass'`. In `_analyse()` (T12) replace the gravity_lowpass call with `g, source = _gravity(acc, b, gyr_arr)` where `gyr_arr = np.array(gyr)` is copied under the same lock as `b`, and add `'gravity_source': source` to the ready dict. Import gravity_complementary from orientation.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import numpy as np,synth,server; from orientation import FS; a,n,d,g=synth.make([('walk',30)],swing_deg=30); errs=[]\nfor i in range(0,len(a),20):\n    server.ingest([{'name':'totalacceleration','values':dict(zip('xyz',v))} for v in a[i:i+20]]+[{'name':'gyroscope','values':dict(zip('xyz',v))} for v in g[i:i+20]])\n    s=server.state()\n    if s['ready'] and i>=2*FS: errs.append(np.degrees(np.arccos(abs(np.dot(s['down'],d[i+19])))))\nprint(s['gravity_source'], round(float(np.mean(errs)),2), server.steps['count'], n)\" prints `gyro <e> 54 54` with e below 2.0 (patched copy: 0.42; the lowpass path on the same input gives about 18.7 and also 54 steps). Sending the gyro entries before the acc entries in each packet must give the same line.",
+  "depends_on": [
+   "T01",
+   "T22",
+   "T18"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "All numbers from scratchpad/verify-server-demo/patched/server.py and t24_t21.py: with sample-number alignment the gyro path counts 54/54 on six walk seeds and matches lowpass on runs; the deg/s guard converts correctly (synthetic gyro median is 2.09 rad/s = 120 deg/s, so the >20 threshold separates units). Gyroscope units are documented as rad/s (scratchpad/sl/UNITS.md:39), so the guard is insurance, not a requirement. Equal acc/gyro sample rates are still assumed (Unverified; T44 checks on a real recording); the late-start offset (`n_gyr` starting at `n_seen`) is an Inference, not run. If the padding condition fails the server silently uses lowpass, which is the pre-task behaviour."
+ },
+ {
+  "id": "T26",
+  "title": "Show steps-per-minute from step intervals instead of 0.5 Hz FFT bins",
+  "area": "server-demo",
+  "files": [
+   "server.py",
+   "dashboard.html"
+  ],
+  "problem": "spm is `round(feat['cadence_hz'] * 60)` (server.py:55) and cadence_hz is the argmax of a 2 s FFT (server.py:43, steps.py:8-9), whose bin spacing is 100/200 = 0.5 Hz, so spm can only be 60, 90, 120, 150, 180... Reproduced (scratchpad/verify-server-demo/baseline.py): a 60 s walk shows spm {90, 120}; a walk30/run30 session shows cadences {1.5, 2.0, 2.5, 3.0} -> spm {90, 120, 150, 180} while true rates are 108 and 168 spm.",
+  "change": "server.py: add `steps['idx'] = collections.deque(maxlen=64)`; in the counting loop in _count_locked() where `steps['count'] += 1` also `steps['idx'].append(int(gi))`. Add `def spm_from_steps(now_idx, feat)`: `recent = [i for i in steps['idx'] if i > now_idx - 10 * FS]`; if `len(recent) >= 3` return `60 * (len(recent) - 1) / ((recent[-1] - recent[0]) / FS)`, else return `feat['cadence_hz'] * 60`. In state() set `'spm': round(spm_from_steps(idx[-1], feat))`. Clear `steps['idx']` in the /reset handler (server.py:76, under lock) and in reset_state(). Change the `cad` line (dashboard.html:34) to read `FFT peak ${s.cadence.toFixed(2)} Hz` so the two numbers are not confused.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import synth, server\nfor mode in ('walk','run'):\n    server.reset_state(); a,t,*_=synth.make([(mode,60)])\n    for i in range(0,len(a),20): server.ingest([{'name':'totalacceleration','values':dict(zip('xyz',v))} for v in a[i:i+20]])\n    print(mode, server.state()['spm'])\" prints `walk <n>` with n in 104..112 and `run <m>` with m in 162..174 (patched copy: 108 and 168; currently prints 120 or 90 for the walk).",
+  "depends_on": [
+   "T12",
+   "T25"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Keep `cadence` (FFT) in the JSON unchanged so the dotted line in the spectrum plot (dashboard.html:43) still works. T28 also makes the FFT cadence continuous, but the interval estimate remains the more direct number for the dashboard. The dependency on T25 only serialises server.py edits. With T18, idx is in 100 Hz units whether resampled or not, so the 10 s window and the /FS conversion stay valid."
+ },
+ {
+  "id": "T27",
+  "title": "Dashboard shows when the phone or server has gone quiet",
+  "area": "server-demo",
+  "files": [
+   "server.py",
+   "dashboard.html"
+  ],
+  "problem": "state() has no notion of when the last packet arrived (server.py:33-56; the not-ready response is exactly {'ready': False} and the ready response has no timing key, verified by printing it): after the phone stops streaming it keeps returning the same 8 s buffer, so the dashboard shows the last activity label and spm forever. dashboard.html:21 'waiting for phone\u2026' is overwritten on the first ready frame (dashboard.html:35) and never comes back, and dashboard.html:46 `catch(e){}` swallows a dead server so a crashed server.py looks identical to a live one during the pitch.",
+  "change": "server.py: `import time`; add `last_rx = [0.0]`; at the end of ingest() set `last_rx[0] = time.time()` when at least one acceleration sample was accepted; state() returns `'age_s': None if last_rx[0] == 0 else round(time.time() - last_rx[0], 1)` in both the ready and not-ready dicts; reset last_rx in reset_state(). dashboard.html: after the `if(s.ready){...}` block add `const t=document.getElementById('tilt'); if(s.age_s!=null && s.age_s>2){t.textContent=`no data for ${s.age_s.toFixed(0)} s -- is the phone still streaming?`; document.body.style.opacity=.5}else{document.body.style.opacity=1}`; in the `catch` set `document.getElementById('tilt').textContent='server unreachable'`.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 -c \"import server, time; print(server.state()['age_s']); server.ingest([{'name':'totalacceleration','values':{'x':0,'y':0,'z':9.81}}]); time.sleep(1.5); s=server.state(); print(s['ready'], s['age_s'] >= 1.4)\" prints `None` then `False True`; and grep -c 'age_s' dashboard.html prints at least `1` (currently `0`).",
+  "depends_on": [
+   "T26"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Reproduced on the patched copy. age_s must be None before the first packet: with last_rx initialised to 0.0 the original text would have shown 'no data for 1.7e9 s' on a fresh server. Keep the tilt line's normal text when age_s <= 2 so the orientation card still reads 'phone tilted N deg from flat'. T13's not-ready test checks only the `ready` key, so the extra keys do not break it."
+ },
+ {
+  "id": "T40",
+  "title": "README: say which printed URL to open, document simulate.py's .true_steps file, add the 127.0.0.1 fallback (keep the clone URL)",
+  "area": "docs-repo",
+  "files": [
+   "README.md"
+  ],
+  "problem": "README.md:40 says 'Open the URL that server.py prints', but server.py:86-87 prints two URLs: a push URL for the phone (http://<ip>:8000/data) and the dashboard (http://localhost:8000). README.md:40 then says 'If the step count moves, you're set up' with no way to check the count: simulate.py:2 claims it 'Prints the true step count' but it only writes a hidden file `.true_steps` once a second (simulate.py:25; the file is already in .gitignore). server.py:85 uses socket.gethostbyname(socket.gethostname()), which prints 127.0.0.1 on this machine (Verified by running it), and README.md:99 tells the phone to paste that URL. The clone URL at README.md:35 (James-Cawse/qmind-step-detector) is NOT wrong: `gh api repos/BigB05092007/qmind-step-detector` reports fork:true with parent James-Cawse/qmind-step-detector, the last commit author is jamescawse, and README.md:31 says James adds students to the repo, so this checkout is a fork and the README correctly points at the upstream.",
+  "change": "Edit README.md only, three places. (1) README.md:40: replace 'Open the URL that `server.py` prints.' with 'Open the Dashboard URL that `server.py` prints (http://localhost:8000); the other URL is the push URL for the phone.' (2) Directly after that sentence add: '`simulate.py` writes the true step count to a hidden file `.true_steps` next to it once a second; run `cat .true_steps` and compare with the dashboard.' (3) In section 6, after step 3 (README.md:99), add a step 4: 'If the printed push URL starts with 127. or says localhost, your laptop has no LAN address yet: use the hotspot IP shown by `ifconfig` (Mac) / `ipconfig` (Windows) in its place.' Do NOT change the clone URL at README.md:35. Do not edit simulate.py (its stale docstring at simulate.py:2 belongs to T20).",
+  "acceptance": "cd /home/user/qmind-step-detector && grep -c 'James-Cawse' README.md; grep -c 'Dashboard URL' README.md; grep -c 'true_steps' README.md; grep -c 'ipconfig' README.md  -> prints `1`, `1`, `1`, `1` on four lines (currently prints `1`, `0`, `0`, `0`); the first line must stay `1`.",
+  "depends_on": [],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The clone-URL fix proposed by demo-7 / ml-11 / eval-12 is refuted and must not be applied by any task: BigB05092007/qmind-step-detector is a fork of James-Cawse/qmind-step-detector (gh api, Verified). If T19 lands first and server.py prints a real LAN address, item (3) is still harmless. If T20 makes simulate.py print the count to the terminal, reword item (2) to mention both the terminal and `.true_steps`."
+ },
+ {
+  "id": "T41",
+  "title": "README: document what the A/B/C/D experiment can and cannot prove, and how to run train.py on synthetic data",
+  "area": "docs-repo",
+  "files": [
+   "README.md"
+  ],
+  "problem": "README.md:13 ('show orientation is what makes it work') and README.md:105 ('A vs B vs C: orientation is what makes it generalise') promise that the experiment proves orientation matters, but B (magnitude only, README.md:15; train.py:42,48) is itself fully orientation-invariant. Re-run on the synthetic 4-person set (scratchpad/ml/fairness.py, 976 windows): leave-one-placement-out A 89%, B 100%, C 94%; adding a 2 Hz horizontal-sway activity (scratchpad/ml/shake.py) still gives B 100% vs C 89%. If real data shows B >= C the pitch collapses in Q&A. README.md:29-40 also gives no way to run train.py without recordings (train.py:58-59 exits with 'No recordings in data/ yet.').",
+  "change": "README.md only. (1) Replace the three bullets at README.md:14-16 with the four variants train.py reports after T35, using the exact labels train.py prints (run `python3 train.py data_synth` after T35 and copy them): A raw x/y/z, B magnitude only, C vertical only, D vertical + horizontal. (2) After the bullets add a paragraph starting with the literal words 'What this shows:' -- 'A vs the rest tests whether orientation-independence matters (expect a large gap). B vs C tests whether knowing the direction of motion helps the classifier (may be small or zero: magnitude is also orientation-free). C vs D tests whether the horizontal part adds anything. If B >= C, the honest claim is that orientation gives a signed vertical signal for step counting and the vertical/horizontal split, not better classification.' (3) Change README.md:105 to 'A vs B vs C vs D: what orientation does and does not buy (see What this shows).' (4) After README.md:40 add one line: 'No phone yet? `python3 make_fixtures.py --out data_synth && python3 train.py data_synth` trains on synthetic recordings.' Use the data-directory form T07 actually implemented (check `python3 train.py --help`). Do not touch train.py: T35 owns its docstring (train.py:1-11) when it adds D.",
+  "acceptance": "cd /home/user/qmind-step-detector && grep -c '^   - [ABCD]' README.md prints `4` (currently `3`); grep -c 'What this shows' README.md prints `1` (currently `0`); grep -c 'make_fixtures' README.md prints a number >= 1 (currently `0`); and the quoted command `python3 make_fixtures.py --out data_synth && python3 train.py data_synth` exits 0 from the repo root.",
+  "depends_on": [
+   "T35",
+   "T40"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "From ml-11. B 100% / C 94% (leave-one-placement-out) and the sway result (B 100%, C 89%) were re-run by this verifier on 2026-10-03. The claim that a signed vertical signal is needed for counting is an Inference and is written as a conditional ('If B >= C ...'); the counting lens can test detect_steps on |a|-9.81 vs vertical and drop the sentence if it is false. The README.md:13 quote in the earlier draft was wrong ('makes it work', not 'generalise'). Depends on T40 to serialise README edits; make_fixtures.py (T02) and the train.py data_dir argument (T07) arrive transitively via T35 -> T34 -> T07 -> T02."
+ },
+ {
+  "id": "T42",
+  "title": "README: answer the orientation-pair gyro question with eval_dsp numbers and list synth.py / eval_dsp.py",
+  "area": "docs-repo",
+  "files": [
+   "README.md"
+  ],
+  "problem": "README.md:89 asks the Orientation pair 'Is the gyro version (gravity_complementary) steadier when running?' with no instructions for how to find out, and the files table (README.md:20-27) does not mention synth.py or eval_dsp.py. On synthetic data the answer is measurable (scratchpad/dsp/e3_tau.py, re-run by this verifier): mean down-direction error for t>=2 s, lowpass tau=1 s vs complementary k=0.995 (the T22 default): walk 0.43 vs 0.23 deg, run 0.31 vs 0.17 deg; with a 30 deg stride-rate arm swing 18.60 vs 0.23 deg (walk) and 18.73 vs 0.20 deg (run). With today's k=0.98 (orientation.py:21) the complementary filter is worse without rotation (0.83 / 0.59 deg), which is why this task depends on T22.",
+  "change": "README.md only. (1) Add two rows to the files table after the `simulate.py` row (README.md:26): '| `synth.py` | Synthetic walk/run/still with true steps, true down and gyro, for testing without a phone |' and '| `eval_dsp.py` | Cadence, half-rule and down-direction metrics on synthetic data (`python3 eval_dsp.py`) |'. (2) Under section 5, after the pair table (README.md:92), add a paragraph for the Orientation pair: 'Run `python3 eval_dsp.py`. On synthetic data the gyro fusion only wins when the phone rotates: with a 30 deg arm swing the lowpass down estimate is off by about 19 deg and the complementary filter by about 0.2 deg; without rotation both are below 0.5 deg. A real hand-held recording with Gyroscope enabled is still needed to confirm this.' Paste the actual numbers that eval_dsp.py prints at the time of the edit (they depend on T01's gyro model and T22's k), rounded to one decimal; do not copy the numbers above blindly. Do not reference task ids in the README.",
+  "acceptance": "cd /home/user/qmind-step-detector && grep -c 'eval_dsp.py' README.md prints a number >= 2 (currently `0`); grep -c 'synth.py' README.md prints a number >= 1 (currently `0`); and `python3 eval_dsp.py` exits 0 and prints the down-direction error lines whose numbers the new paragraph quotes.",
+  "depends_on": [
+   "T03",
+   "T22",
+   "T41"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "From dsp-10. Numbers re-measured by this verifier from scratchpad/dsp/e3_tau.py (lowpass 0.43/0.31/18.60/18.73; complementary k=0.995 0.23/0.17/0.23/0.20) and the T03 prototype scratchpad/verify-fixtures-eval/eval_dsp.py (same lowpass numbers; complementary at k=0.98 0.83/0.59/0.82/0.58). The final eval_dsp.py values may differ slightly once synth.py (T01) is the shared source, so the README copies what the script prints. Depends on T41 to serialise README edits."
+ },
+ {
+  "id": "T43",
+  "title": "README: 'Measure accuracy' section with the fixture, evaluate and test commands",
+  "area": "docs-repo",
+  "files": [
+   "README.md",
+   ".gitignore"
+  ],
+  "problem": "README.md:92 tells the Accuracy pair to 'Compare detected steps with real steps on every recording. Target: within 3%' but gives no command, and the files table (README.md:20-27) has no row for the evaluator, the fixture generator or the tests. README.md:51 says to write the step count in steps.txt without saying it must be the bare integer. .gitignore (3 lines: __pycache__/, .true_steps, .DS_Store) does not exclude data_synth, so `git add -A` (README.md:77) would commit 24+ synthetic recordings.",
+  "change": "(1) Add rows to the files table (README.md:20-27): '| `make_fixtures.py` | Synthetic recordings in the Sensor Logger folder layout, with steps.txt |', '| `evaluate.py` | Counted vs true steps per recording, 3% gate |', '| `tests/` | Regression tests: `python3 tests/run.py` |'. (2) Change README.md:51 to say steps.txt contains only the integer count, e.g. `echo 50 > steps.txt`. (3) Append a section '## 7. Measure accuracy' after section 6 listing, each with its one-line expected output copied from a real run: `python3 make_fixtures.py --out data_synth --hard` (writes data_synth/ and data_synth_mixed/), `python3 evaluate.py --data data_synth` (ends with the `overall:` line; say that the --hard recordings are expected to fail the 3% gate until the counting fixes land), `python3 evaluate.py --data data` once real recordings exist, and `python3 tests/run.py` (exit 0). (4) If .gitignore does not yet contain it (T02 may have added it), add the line `data_synth*/`. Do not touch the clone URL. Under 30 README lines changed.",
+  "acceptance": "cd /home/user/qmind-step-detector && grep -c 'evaluate.py' README.md prints a number >= 3 (currently `0`); grep -c '## 7. Measure accuracy' README.md prints `1`; python3 make_fixtures.py --out data_synth --hard && python3 evaluate.py --data data_synth | tail -1 | grep -c '^overall' prints `1`; python3 tests/run.py; echo $? ends with `0`; git status --porcelain | grep -c data_synth prints `0`.",
+  "depends_on": [
+   "T10",
+   "T06",
+   "T42"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "From eval-12. evaluate.py's exit code on the --hard set is deliberately not part of acceptance: dave_run_pocket (stride asymmetry 1.0) is the known half-cadence failure and T09's 3% gate may exit non-zero on it until T28/T30/T31 land, so the README must say so and the acceptance only checks the `overall` line. The `--data data` command cannot be run by an agent until recordings exist. Size M only because of the conditional one-line .gitignore edit; if T02 already added it this is a one-file S task. Depends on T42 to serialise README edits; T09 (evaluate.py) arrives transitively via T10."
+ },
+ {
+  "id": "G01",
+  "title": "make_fixtures.py --layout ios: iOS export layout (Accelerometer.csv + Gravity.csv, z,y,x header, iOS sign) so train.load's iOS branch is tested",
+  "area": "fixtures-eval",
+  "files": [
+   "make_fixtures.py"
+  ],
+  "problem": "T02's write_recording (scratchpad/verify-fixtures-eval/make_fixtures.py:10-16) writes only TotalAcceleration.csv with columns time,seconds_elapsed,x,y,z. The team is all-iPhone (scratchpad/decisions.md item 4) and iOS Sensor Logger exports Accelerometer.csv (gravity removed) + Gravity.csv with header `time,seconds_elapsed,z,y,x` and the opposite axis sign (scratchpad/sl/UNITS.md:18-24; facts-ios-sensorlogger.md). The iOS branch of the loader (train.py:28-31: `a, g = read(\"Accelerometer\"), read(\"Gravity\")`, `n = min(len(a), len(g))`, sum of x,y,z) is exercised by no agent-runnable task; T33 rewrites that loader and G02 changes its pairing. Re-run of scratchpad/gaps/e2_ios_layout.py: 24 fixtures in the iOS layout loaded with train.py:28-35's arithmetic give the identical 880 counted steps and identical per-hop labels in 24/24 folders; vertical_horizontal (orientation.py:35-42) is exactly invariant to the global sign flip (max |dv| = 0.0, max |dh| = 0.0, down flipped).",
+  "change": "In make_fixtures.py extend `write_recording(folder, acc, true_steps, layout='android', true_down=None)`: when `layout == 'ios'`, `grav = -9.80665 * true_down` and `user = -acc - grav` (iOS sign: all axes negated relative to Android; a+g then equals -acc); write `Accelerometer.csv` from `user` and `Gravity.csv` from `grav`, both with columns exactly `time,seconds_elapsed,z,y,x` in that order; do not write TotalAcceleration.csv; steps.txt unchanged. Add `--layout {android,ios}` (default android) to the argparse; in the main loop unpack `acc, true, down, _ = make(...)` (synth.make returns acc, true, downs, gyro) and pass `true_down=down, layout=a.layout`; the --hard folders (T10a) use the same flag. About 15 added lines.",
+  "acceptance": "cd /home/user/qmind-step-detector && rm -rf data_synth_ios && python3 make_fixtures.py --out data_synth_ios --layout ios && ls data_synth_ios/p1_walk_hand && head -1 data_synth_ios/p1_walk_hand/Accelerometer.csv && python3 evaluate.py --data data_synth_ios | grep '^overall'  -> prints `Accelerometer.csv`, `Gravity.csv`, `steps.txt`, `time,seconds_elapsed,z,y,x`, then `overall: true=872 counted=880 err=+0.9%  24/24 recordings within 3%` (identical to the android layout). `ls data_synth_ios/p1_walk_hand | grep -c Total` prints `0`. `python3 train.py data_synth_ios | head -1` starts with `976 windows` (8 x 54 + 16 x 34 windows from train.py:45's range(FS, len-WIN, 50)).",
+  "depends_on": [
+   "T10a",
+   "T09"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Regression fixture for T33's loader rewrite and G02's Gravity interpolation; re-run its acceptance after each. Use grep '^overall' rather than tail -1 because T10b appends a `label accuracy:` line after the overall line. The 9.80665 vs 9.81 difference cancels when user and gravity are summed. Synthetic Gravity.csv holds the true down vector whereas CoreMotion's is fused; that is fine for testing the loader arithmetic, not the orientation estimate. Whether T02's .gitignore line is `data_synth*/` is Inference (T02's text not visible); if it is `data_synth/`, add `data_synth_ios/`."
+ },
+ {
+  "id": "G02",
+  "title": "train.load: read seconds_elapsed, interpolate Gravity onto accelerometer times, resample to 100 Hz when the recorded rate is off by more than 5%",
+  "area": "classify-ml",
+  "files": [
+   "train.py"
+  ],
+  "problem": "train.load (train.py:23-36) ignores the `time` and `seconds_elapsed` columns and returns rows as if they were 100 Hz, and its iOS branch (train.py:30-31) pairs Accelerometer and Gravity rows by position although Sensor Logger documents that sensor streams 'do not necessarily align' (scratchpad/sl/README.md:114) and recommends np.interp onto one sensor's timestamps (sl/README.md:334-358). T17/T18 fix the rate in server.py only (scratchpad/verify-server-demo/patched/server.py:64-78); evaluate.py (T09) and train.py both go through load(), so an off-rate recording is mis-counted and mis-labelled offline (outline.md section 4 item 8 half covered). Measured (gaps/e6_accept_numbers.py re-run, T08 counter): a 50 Hz copy of fixture p1_walk_hand counts 41 of 54 and reads RUNNING; p1_run_pocket counts 27 of 55; linear interpolation onto a 100 Hz grid from seconds_elapsed restores 54/54 and 55/55 and leaves the 100 Hz fixture untouched (3000 rows, 54). Additionally measured (verify-gaps, this verifier): an iOS-layout folder whose Gravity.csv runs at 98 Hz with a 50 ms offset loads to 3000 rows and 54/54 steps with interpolation, where positional `min(len(a), len(g))` would keep 2941 rows.",
+  "change": "In load() (after T33's rewrite) also read the time column: `t = df['seconds_elapsed'].values.astype(float)`, falling back to `df['time'].values / 1e9` when seconds_elapsed is absent, and to `np.arange(len(df)) / FS` when neither exists. Sort rows by t (`order = np.argsort(t, kind='stable')`) and drop rows whose timestamp does not increase (`keep = np.r_[True, np.diff(t) > 0]`). iOS branch: interpolate Gravity onto the accelerometer times, `g_i = np.column_stack([np.interp(t_acc, t_grav, g[k].values) for k in 'xyz'])`, instead of `n = min(len(a), len(g))`. Then `rate = (len(t) - 1) / (t[-1] - t[0])`; if `abs(rate - FS) / FS > 0.05`: `grid = np.arange(t[0], t[-1], 1 / FS)`, `acc = np.stack([np.interp(grid, t, acc[:, k]) for k in range(3)], axis=1)` and print `f'warning: {folder}: {rate:.1f} Hz, resampled to {FS} Hz'` to stdout. Keep the g-unit rescale (train.py:34-35) after resampling. Expose `def sample_rate(folder)` returning that rate for check_recording.py (G03). About 25 changed lines.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 make_fixtures.py --out data_synth && rm -rf data_synth_50 && mkdir -p data_synth_50/p1_walk_hand data_synth_50/p1_run_pocket && for n in p1_walk_hand p1_run_pocket; do python3 -c \"import pandas as pd; pd.read_csv('data_synth/$n/TotalAcceleration.csv').iloc[::2].to_csv('data_synth_50/$n/TotalAcceleration.csv', index=False)\"; cp data_synth/$n/steps.txt data_synth_50/$n/; done && python3 -c \"from train import load; print(len(load('data_synth_50/p1_walk_hand')), len(load('data_synth/p1_walk_hand')))\" && python3 evaluate.py --data data_synth_50 | grep -E 'p1_|overall'  -> prints `warning: data_synth_50/p1_walk_hand: 50.0 Hz, resampled to 100 Hz` then `2998 3000`, then (one warning line per folder) rows `p1_run_pocket            true=  55 counted=  55 err=  +0.0% ok` and `p1_walk_hand             true=  54 counted=  54 err=  +0.0% ok` (with T10b's ` label=...` suffix when present) and `overall: true=109 counted=109 err=+0.0%  2/2 recordings within 3%`. Before the change the same rows read `counted=  27` and `counted=  41`.",
+  "depends_on": [
+   "T33",
+   "T09"
+  ],
+  "size": "S",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The shell loop in the acceptance was executed as written (1501 and 1001 CSV lines). 2998 = len(np.arange(0, 29.98, 0.01)). Whether iPhones deliver exactly 100 Hz remains Unverified (T44 prints the measured rate), so this is robustness; the Gravity interpolation, however, fixes a real pairing assumption. The row format matches T09's verifier (scratchpad/verify-fixtures-eval/check_counts.py:36). Depends on T33 to serialise edits to load()."
+ },
+ {
+  "id": "G03",
+  "title": "Add check_recording.py: pre-flight for a Sensor Logger export folder (files, columns, rate, duration, |a|, steps.txt, Metadata.csv)",
+  "area": "fixtures-eval",
+  "files": [
+   "check_recording.py"
+  ],
+  "problem": "README.md:51 asks each person to unzip a Sensor Logger export into data/ and write steps.txt, and README.md:69 says everyone pulls everyone's data, but nothing in the repo or the task list tells a recorder whether their folder is usable before it reaches train.py/evaluate.py: T32/T33 make train.py skip a bad folder with a hint after the fact, and no task reads Metadata.csv (platform, sampleRateMs, standardisation; facts-ios-sensorlogger.md) or checks sample rate, duration, |a| magnitude or that steps.txt holds a bare integer. Fixture numbers for the acceptance re-measured (gaps/e5_check_numbers.py): p1_walk_hand 3000 rows, 30.0 s, median |a| 9.44 m/s^2, steps.txt '54'; (len(t)-1)/(t[-1]-t[0]) = 2999/29.99 = 100.0 Hz.",
+  "change": "Create check_recording.py (<= 45 lines): usage `python3 check_recording.py FOLDER [FOLDER...]`. Per folder: `files = {os.path.basename(p).lower(): p ...}` over `*.csv`, print `files: [<original basenames sorted>]`; PROBLEM unless totalacceleration.csv or (accelerometer.csv and gravity.csv) exist; read the acceleration CSV with pandas, print `columns: {list(df.columns)}`, PROBLEM unless {'x','y','z'} is a subset after lower-casing; `t = df['seconds_elapsed'].values` -> print `rate: {(len(t)-1)/(t[-1]-t[0]):.1f} Hz  rows: {len(t)}  duration: {t[-1]-t[0]:.1f} s`, PROBLEM when rate is outside 90-110 or duration < 10 s; `acc = train.load(folder)` -> print `median |a|: {np.median(np.linalg.norm(acc, axis=1)):.2f} m/s^2`, PROBLEM when outside the plausibility bounds T25a's gravity_ok uses (import them from orientation under whatever names T25a gave them; if T25a exposes no constants, define `G_MIN, G_MAX = 5.0, 14.0` locally); steps.txt -> print `steps.txt: {n}` or PROBLEM `steps.txt missing or not an integer (write e.g. echo 50 > steps.txt)`; if Metadata.csv exists print its platform / sampleRateMs / standardisation columns when present; folder-name check via T32's parser (whatever T32 named it; if T32 exposes none, `len(basename.split('_')) >= 3` with activity in {walk,run,still}) -> PROBLEM with the rename hint. End with `OK {folder}` or `PROBLEM {folder}: <first problem>`; `sys.exit(1)` if any folder had a problem.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 make_fixtures.py --out data_synth && python3 check_recording.py data_synth/p1_walk_hand; echo exit=$?  -> prints `files: ['TotalAcceleration.csv']`, `columns: ['time', 'seconds_elapsed', 'x', 'y', 'z']`, `rate: 100.0 Hz  rows: 3000  duration: 30.0 s`, `median |a|: 9.44 m/s^2`, `steps.txt: 54`, `OK data_synth/p1_walk_hand`, `exit=0`. Then `mkdir -p /tmp/bad_walk_hand && cp data_synth/p1_walk_hand/TotalAcceleration.csv /tmp/bad_walk_hand/ && echo fifty > /tmp/bad_walk_hand/steps.txt && python3 check_recording.py /tmp/bad_walk_hand; echo exit=$?` ends with a line starting `PROBLEM /tmp/bad_walk_hand: steps.txt` and `exit=1`.",
+  "depends_on": [
+   "T33",
+   "T25a",
+   "T02"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The problem and the fixture numbers are Verified; the identifiers `G_MIN/G_MAX` and `parse_name` the critic cited are Inference (T25a's and T32's index titles do not fix those names), hence the fallbacks in the change. Print the rate before calling load() so the line is not interleaved with G02's resample warning. Real iOS header `time,seconds_elapsed,z,y,x` passes the by-name check; the 'Standardise Units & Frames' sign flip leaves |a| unchanged. Synthetic medians: 9.44 (walk hand), 8.35 (run pocket), 9.81 (still). G08's check.sh runs this over every folder in data/."
+ },
+ {
+  "id": "G04",
+  "title": "simulate.py --ios, --seed, --dump and 0.2 s timestamped batches: rehearse the iPhone stream format, not Android's",
+  "area": "server-demo",
+  "files": [
+   "simulate.py"
+  ],
+  "problem": "simulate.py sends one `totalacceleration` sample per HTTP POST with no `time` field (simulate.py:22-23) and R is drawn unseeded (simulate.py:6). iOS Sensor Logger streams `accelerometer` (gravity removed) plus `gravity`, never `totalacceleration` (facts-ios-sensorlogger.md; sl/UNITS.md:18-24), in batched packets whose entries carry epoch-nanosecond `time` (sl/PUSHING.md:22-38). The rehearsal path therefore never exercises server.py:27-28 (the gravity merge), T17's rate measurement (needs `time`), T18's resampling or T16's stream guard. Measured (scratchpad/verify-gaps/g04_ios_batches.py): a 60 s walk sent as 300 packets of 20 gravity+accelerometer pairs with ns timestamps counts 108/108 on the repo server.py and 108/108 on the T12-T27 patched server (verify-server-demo/patched/server.py) with n_seen 6000, final state WALKING and fs_measured 100.0; a 60 s run counts 168/167.",
+  "change": "In simulate.py main() (after T21): accumulate samples and POST one packet every `--batch-s` seconds (default 0.2 -> 20 samples per packet); give every entry `'time': t_start_ns + i * 10_000_000` (int, t_start_ns = time.time_ns() at start, i = sample counter) so the server measures exactly 100 Hz regardless of HTTP latency. Add `--ios` (store_true): per sample emit `{'name': 'gravity', 'time': ..., 'values': R.T @ [0, 0, 9.81]}` followed by `{'name': 'accelerometer', 'time': ..., 'values': R.T @ (world - [0, 0, 9.81])}` instead of the totalacceleration entry; with `--reorient-every` the current R is used for both. Add `--seed INT` (default None) feeding `np.random.default_rng(seed)` for R and the noise. Add `--dump FILE`: write each packet as one JSON line (`{'messageId': k, 'payload': [...]}`) to FILE instead of POSTing, with no per-sample sleep and without starting the Enter-toggle thread; usable with `--seconds`; at the end print the same `true steps: N` line T21's offline mode prints.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 simulate.py --seconds 60 --ios --seed 1 --dump /tmp/pk.jsonl < /dev/null | tail -1 && wc -l < /tmp/pk.jsonl && python3 -c \"import json, server; p=json.loads(open('/tmp/pk.jsonl').readline()); print(len(p['payload']), sorted({e['name'] for e in p['payload']}), isinstance(p['payload'][0]['time'], int)); [server.ingest(json.loads(l)['payload']) for l in open('/tmp/pk.jsonl')]; s=server.state(); print(server.n_seen[0], s['state'], round(s['fs_measured']), abs(server.steps['count']-108)<=3)\"  -> prints `true steps: 108`, `300`, `40 ['accelerometer', 'gravity'] True`, `6000 WALKING 100 True`; the dump run finishes in under 5 s.",
+  "depends_on": [
+   "T21",
+   "T17"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The 108/108 count, n_seen, state and fs numbers were measured by this verifier with the exact packet shape (gravity-then-accelerometer per sample, 40 entries per packet). The exact wording `true steps: 108` depends on T21's offline-mode print (Inference); 108 itself is fixed by phase accumulation (1.8 Hz x 60 s) independent of seed. `python3 simulate.py` with no flags must keep today's behaviour (walk, Enter toggles, localhost:8000) apart from batching. T16 locks the server to the first acceleration stream seen, so do not mix --ios and default mode in one server session."
+ },
+ {
+  "id": "G05",
+  "title": "Public-URL demo fallback: server.py --port / --public-url and a README section for a tunnel (decision 3)",
+  "area": "server-demo",
+  "files": [
+   "server.py",
+   "README.md"
+  ],
+  "problem": "scratchpad/decisions.md item 3 (user said yes) asks for a demo-wave task that runs server.py behind a public URL so a phone can stream over cellular when the hotspot fails, and item 5 keeps it as the fallback demo path; no task in the index does it. server.py hard-codes `PORT = 8000` (server.py:11) and prints only a LAN URL (server.py:85-87; T19 fixes the address, not the scheme), so there is no way to hand Sensor Logger a tunnel URL or run a second instance. Decision 3's prerequisite (counting off the GET /state poll, server.py:67-69) is T12. server.py:12-15 keeps one buffer and one counter in process memory, so the deployment must be a single long-lived process. Neither cloudflared nor ngrok is installed here (`which cloudflared ngrok` prints nothing).",
+  "change": "server.py `__main__` block (after T19): argparse with `--port INT` (default 8000) and `--public-url URL` (default None); bind ThreadingHTTPServer to the chosen port; print `Sensor Logger push URL:  {public_url.rstrip('/')}/data` when given, else the T19 LAN form; print `Dashboard:               http://localhost:{port}`. README.md: after section 6 step 4 (T40) add '### 6b. No shared hotspot? Public URL fallback' (<= 12 lines): run `cloudflared tunnel --url http://localhost:8000` (free quick tunnel, no account) and copy the printed `https://....trycloudflare.com` URL; run `python3 server.py --public-url https://....trycloudflare.com`; paste the printed push URL into Sensor Logger; the phone can be on cellular. State the limit: one server serves one phone at a time (server.py:12-15 holds state in memory) and it must not be deployed serverless.",
+  "acceptance": "cd /home/user/qmind-step-detector && (python3 server.py --port 8123 --public-url https://example.trycloudflare.com > /tmp/srv.log 2>&1 &) && sleep 2 && curl -s localhost:8123/state && echo && head -2 /tmp/srv.log && pkill -f 'server.py --port 8123'  -> prints a JSON line starting `{\"ready\": false`, then `Sensor Logger push URL:  https://example.trycloudflare.com/data` and `Dashboard:               http://localhost:8123`; `grep -c trycloudflare README.md` prints at least `2`; `python3 server.py --help` exits 0.",
+  "depends_on": [
+   "T19",
+   "T27",
+   "T43"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The decision and the hard-coded port are Verified; the tunnel command itself is Unverified here (no cloudflared/ngrok in the container), so the README text cannot be executed by an agent. The end-to-end phone-on-cellular check is a human step: add it to T44's recording session (start the tunnel, stream 30 s from cellular, confirm the dashboard moves). Per-device keying (deviceId is in every push, sl/PUSHING.md:22-33) is deliberately not included; T16's first-stream guard is enough for one phone. The not-ready dict stays `{\"ready\": false, ...}` first-key after T27 (patched server.py:128), so the JSON prefix check holds. Depends on T27 to serialise server.py edits and on T43 for README."
+ },
+ {
+  "id": "G06",
+  "title": "STEPS_MODEL env var to force the rule, and evaluate.py prints which classifier produced its numbers",
+  "area": "classify-ml",
+  "files": [
+   "steps.py",
+   "evaluate.py"
+  ],
+  "problem": "After T38, steps.classify is model-backed whenever model.joblib sits next to steps.py, and T08's count_steps (scratchpad/verify-counting/base/steps.py:65-87) calls classify for every hop, so evaluate.py's output silently depends on whether a model file happens to exist. Re-measured (gaps/e4_model_present.py, T08 counter + the verifier's 100-tree D model with n_windows 976): with the rule the --hard set prints dave_run_pocket `counted=168 label=30%` and `label accuracy: 93.4%`; with the model present the same input prints `label=100%` and `100.0%` (step counts unchanged: 1156/1147, dave 168 in both). A synthetic-trained model.joblib left in the repo root by T37's acceptance therefore makes T10b's expectation pass or fail depending on task order, and a run of evaluate.py cannot be read without knowing which classifier was active.",
+  "change": "steps.py: in the model loader T38 introduces (the critic assumed `load_model(path=None)`, `MODEL_PATH` and a `_model[0]` slot; use T38's actual names), resolve `path = os.environ.get('STEPS_MODEL', MODEL_PATH) if path is None else path`; an empty string or a missing file leaves the model slot None (rule); store the resolved path in the loaded dict as `d['path']`. Add `def model_info(): d = <loaded dict or None>; return None if d is None else f\"{os.path.basename(d['path'])} ({d['n_windows']} windows)\"` (n_windows is the key T37 stores; if T37 used another key, use that). evaluate.py: print `classifier: {steps.model_info() or 'rule'}` as the first output line. No change to count_steps.",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 train.py data_synth --save > /dev/null  (or T37's actual way of writing model.joblib from data_synth) && python3 evaluate.py --data data_synth | head -1 && STEPS_MODEL= python3 evaluate.py --data data_synth | head -1 && STEPS_MODEL=/nonexistent python3 evaluate.py --data data_synth | head -1  -> prints `classifier: model.joblib (976 windows)`, `classifier: rule`, `classifier: rule`. Then with the --hard fixtures: `STEPS_MODEL= python3 evaluate.py --data data_synth | grep dave_run` shows `label= 30%` before T28 and `label=100%` after it, while `python3 evaluate.py --data data_synth | grep dave_run` (model present) shows `label=100%` in both cases; step counts are `counted= 168` in all four runs.",
+  "depends_on": [
+   "T38",
+   "T15",
+   "T10b"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "The 30% / 100% / 168 numbers are Verified by re-running e4. The identifiers `load_model`, `MODEL_PATH`, `_model`, `n_windows` and the `--save` flag are Inference: T37/T38 index titles do not fix them, and the critic's own tasks disagree (G06 says `--save`, G07/G08 say T37 saves by default); the implementer must read T37/T38 as landed. T11 pins classify_rule and T13's test_walk_count expects WALKING, which the synthetic model also gives, so the test suite is unaffected; optionally tests/run.py (T06) sets `os.environ.setdefault('STEPS_MODEL', '')` before importing test files. T10b's acceptance text should say 'with the rule (STEPS_MODEL= )'. Depends on T15 and T10b to serialise evaluate.py edits and on T38 for the loader."
+ },
+ {
+  "id": "G07",
+  "title": "Dashboard and /state show which classifier is live (rule vs model.joblib with its training size)",
+  "area": "server-demo",
+  "files": [
+   "server.py",
+   "dashboard.html"
+  ],
+  "problem": "README.md:91 asks the ML pair to 'Swap the rule in steps.classify for the trained model' and the pitch (README.md:101-105) presents the model, but after T38 the swap is invisible: state() (server.py:54-56) returns the label with no indication of its source, dashboard.html:20 shows only the label and cadence, and a missing or unloadable model.joblib falls back to the rule with one console print at import (T38) that nobody watches during the demo. Neither the audience nor the team can tell whether the live demo runs the trained model or the baseline rule, and a synthetic-trained model.joblib left over from T37's acceptance would be indistinguishable from the real one.",
+  "change": "server.py: `from steps import model_info` and add `'classifier': model_info() or 'rule'` to both the ready and the not-ready dicts returned by state() (after T27 these are the dicts at patched server.py:128 and :135-139). dashboard.html: add `<div class=\"sub\" id=\"clf\">&nbsp;</div>` after the `cad` div inside the Activity card (dashboard.html:20) and in tick() set `document.getElementById('clf').textContent='via '+s.classifier` in both the ready branch and the T25b else branch. No other changes.",
+  "acceptance": "cd /home/user/qmind-step-detector && (write model.joblib from data_synth as in G06's acceptance) && python3 -c \"import server; print(server.state()['classifier'])\" && STEPS_MODEL= python3 -c \"import server; print(server.state()['classifier'])\" && grep -c 's.classifier' dashboard.html  -> prints `model.joblib (976 windows)`, `rule`, `2`. python3 tests/test_server.py still prints `ok`.",
+  "depends_on": [
+   "G06",
+   "T27"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "README.md:91 and :101-105, server.py:54-56 and dashboard.html:20 are Verified by reading. The claim that T13 checks only the `ready` key on the not-ready dict is Inference (T13's text not visible); if T13 compares the whole dict, update that assertion. The demo model must come from `python3 train.py` on real data/ (T37), never from data_synth; this task makes a wrong model visible rather than preventing it (see G08 for the clobber hazard). Depends on T27 to serialise server.py and dashboard.html edits."
+ },
+ {
+  "id": "G08",
+  "title": "Add check.sh: one command that runs every gate on synthetic data and, given a directory, on real recordings; git-ignore model.joblib",
+  "area": "docs-repo",
+  "files": [
+   "check.sh",
+   ".gitignore"
+  ],
+  "problem": "The plan creates seven separately run checks (tests/run.py T06, eval_dsp.py T03, make_fixtures.py T02/T10a, evaluate.py T09, train.py T07, check_recording.py G03, spectrogram.py T29) and README section 7 (T43) lists them, but there is no single command an agent or teammate runs before pushing, and nothing says what to run the moment real recordings land in data/. If T37 writes model.joblib by default, no task adds it to .gitignore (today 3 lines: `__pycache__/`, `.true_steps`, `.DS_Store`), so `git add -A` (README.md:77) would commit a ~90 KB binary (verify-classify-ml/model.joblib is 93,831 bytes) trained on whatever data the committer had. Measured budget (scratchpad/verify-gaps/g08_timing.py): feature extraction for 24 folders 1.1 s, A/B/C/D x 6 folds x 200 trees 6.6 s, final D fit 0.3 s, make_fixtures --hard 1.2 s, count_steps x 27 0.8 s, eval_dsp 2.0 s.",
+  "change": "Create check.sh (bash, `set -euo pipefail`, `cd \"$(dirname \"$0\")\"`, `chmod +x`): run in order `python3 tests/run.py`, `python3 eval_dsp.py`, `python3 make_fixtures.py --out data_synth --hard`, `STEPS_MODEL= python3 evaluate.py --data data_synth`, then train.py on data_synth WITHOUT leaving a synthetic model in the repo root: if T37 has an opt-in save flag just run `python3 train.py data_synth`; if T37 saves by default, wrap it: `bak=$(mktemp -d); [ -f model.joblib ] && cp model.joblib \"$bak/\"; python3 train.py data_synth; if [ -f \"$bak/model.joblib\" ]; then cp \"$bak/model.joblib\" model.joblib; else rm -f model.joblib; fi`. Then `DATA=${1:-}`; if non-empty: `shopt -s nullglob; folders=(\"$DATA\"/*/); if [ ${#folders[@]} -eq 0 ]; then echo \"no recordings in $DATA\"; exit 2; fi; python3 check_recording.py \"${folders[@]}\"; python3 evaluate.py --data \"$DATA\"; python3 train.py \"$DATA\"` (this one may save: the real-data model is the demo model). Finally `echo CHECK OK`. Append `model.joblib` to .gitignore. (T43's README section 7 should then point at `./check.sh` and `./check.sh data`; a one-line README edit by whichever of T43/G08 lands last.)",
+  "acceptance": "cd /home/user/qmind-step-detector && ./check.sh > /tmp/check.log 2>&1; echo exit=$?; tail -1 /tmp/check.log; ./check.sh data > /tmp/check2.log 2>&1; echo exit=$?; tail -1 /tmp/check2.log; grep -c '^model.joblib$' .gitignore  -> prints `exit=0`, `CHECK OK`, `exit=2`, `no recordings in data` (data/ holds only .gitkeep), `1`. Each run finishes in under 30 s. `touch model.joblib.real && cp model.joblib.real model.joblib; ./check.sh > /dev/null; cmp model.joblib model.joblib.real && echo kept` prints `kept` (a pre-existing model.joblib survives the synthetic run); clean up both files afterwards.",
+  "depends_on": [
+   "T43",
+   "G03",
+   "G06",
+   "T10a"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Added by this verifier: the original change ran `python3 train.py data_synth` unguarded, which (if T37 saves by default, as G07/G08 themselves assume) overwrites the real-data demo model with a synthetic one every time someone runs the pre-push check, contradicting G07's note. The composition itself was not run; the component timings sum to about 13 s plus tests/run.py (T04/T05/T13/T14; the HTTP test is the only one that could be slow), so 'under 30 s' is Inference. The --hard set passes evaluate.py's gate (26/26 ok, +0.8%, gaps/e1_t31_fixtures.py), so the script reaches train.py. Expected numbers in every task assume numpy 2.4.6's RNG and QR sign conventions (T01 note)."
+ },
+ {
+  "id": "G09",
+  "title": "Add oracle_dump.py: JSON test vectors (input, gravity, vertical, per-hop features, states, step count) for the iOS port's oracle test",
+  "area": "fixtures-eval",
+  "files": [
+   "oracle_dump.py"
+  ],
+  "problem": "scratchpad/decisions.md items 5-6 (user): the target is an on-board iOS app that ports orientation.py + steps.py to Swift, with 'Python output on identical input' as the test oracle, starting 'as soon as the maths is stable enough to port'; there is no Swift toolchain here (`which swift` prints nothing). No task in the index produces that oracle, so the iOS track cannot start. The pipeline is deterministic given the input array (gravity_lowpass orientation.py:10-18, vertical_horizontal :35-42, features steps.py:27-39, classify :42-46, detect_steps :49-62, count_steps T08), so a JSON dump of inputs and intermediates per synthetic recording lets a port test itself without numpy. Re-measured (gaps/e6_accept_numbers.py and verify-gaps/g09_oracle_size.py): walk_10s seed 0: N=1000, true 18, counted 18, 36 hops all WALKING; run_10s: true 27, counted 28, 36 hops all RUNNING; mixed_30s: true 63, counted 64, 136 hops (85 WALKING, 51 RUNNING); JSON sizes 93 + 93 + 286 = 472 KB; count_steps on the 6-decimal-rounded acc re-read from JSON reproduces count and every state exactly (max |dv| 6e-7).",
+  "change": "Create oracle_dump.py (<= 45 lines). Set `os.environ.setdefault('STEPS_MODEL', '')` before importing steps so the oracle is always the rule (the Swift port ports the rule, not the RandomForest). For `('walk_10s', [('walk',10)])`, `('run_10s', [('run',10)])`, `('mixed_30s', [('walk',10),('run',10),('walk',10)])` with `acc, true, *_ = synth.make(seq, seed=0)`: `g = gravity_lowpass(acc)`; `v, h, down = vertical_horizontal(acc, g)`; per hop `end in range(3*FS, len(acc)+1, 20)` compute `feat = features(v[end-2*FS:end], h[end-2*FS:end])` and `state = classify_rule(feat)` (`try: from steps import classify_rule except ImportError: from steps import classify as classify_rule`); `count, states = count_steps(acc)`. Write `oracle/<name>.json` with keys `fs`, `acc` (N x 3, rounded to 6 decimals), `true_steps`, `g`, `vertical`, `horizontal`, `hops` (list of dicts: end plus the seven feature keys and state), `count`, `states`, `generator` ({'seed': 0, 'seq': seq, 'synth_sha256': sha256 of synth.py}). Add `--check`: re-read each JSON and assert `count_steps(np.array(d['acc']))[0] == d['count']` and the states list matches, printing `ok <name>`. Module docstring: regenerate whenever steps.py or orientation.py changes (T28/T31 change hop cadences and gaps).",
+  "acceptance": "cd /home/user/qmind-step-detector && python3 oracle_dump.py && python3 -c \"import json; d=json.load(open('oracle/walk_10s.json')); print(len(d['acc']), d['true_steps'], d['count'], len(d['hops']), d['hops'][0]['state'])\" && python3 -c \"import json; d=json.load(open('oracle/mixed_30s.json')); print(d['true_steps'], d['count'], len(d['states']))\" && python3 oracle_dump.py --check  -> prints `1000 18 18 36 WALKING`, `63 64 136`, then `ok walk_10s`, `ok run_10s`, `ok mixed_30s`. `du -sk oracle | cut -f1` prints a number below 1024 (measured 472 KB of file content).",
+  "depends_on": [
+   "T08",
+   "T01"
+  ],
+  "size": "M",
+  "needs_human": false,
+  "evidence": "Verified",
+  "notes": "Counts measured with the T08 counter on the unmodified steps.py; after T28 the hop `cadence_hz` values change (padded FFT) and after T31 detect_steps' gap changes, so the JSON must be regenerated then (Inference that the counts hold, as they do for the 26 fixtures). run_10s counts 28 for 27 true (+3.7%): it is an equality fixture for the port, not a 3% gate. The STEPS_MODEL guard only has effect once G06 lands; until T38 lands classify is the rule anyway. The iOS track itself (Swift package, direct DFT with N=200 to match numpy bins, CMMotionManager spike, TestFlight) has no area in this plan and needs its own wave."
+ },
+ {
+  "id": "G10",
+  "title": "Team records the README section 2 set (walk/run x hand/pocket + still, per person) and runs ./check.sh data; paste the real overall line and A/B/C/D block into README section 7",
+  "area": "docs-repo",
+  "files": [
+   "README.md"
+  ],
+  "problem": "data/ holds only .gitkeep (Verified: `ls -la data`), so goals 2 (3% on real steps, README.md:92) and 3 (A/B/C generalisation, README.md:105) are measured on synthetic data only, and the only needs_human task (T44) records a single hand-held walk. README.md:44-51 asks every person for five recordings (walk/run x hand/pocket, 20 s still) with steps.txt, and train.py's leave-one-out loops (train.py:63-70) need at least two placements and two people to have a held-out fold. Nothing in the plan schedules that recording session or says what to run once the folders are committed.",
+  "change": "Human part: at least two people each record the five README section 2 recordings at 100 Hz with Accelerometer, Gravity and Gyroscope on, export CSV, unzip into data/<name>_<walk|run|still>_<hand|pocket>/, write steps.txt (bare integer; 0 for still), commit. Agent part afterwards: run `./check.sh data` (G08), fix any PROBLEM lines by renaming or re-recording (human), then paste into README section 7 (T43) the `classifier:` and `overall:` lines from `STEPS_MODEL= python3 evaluate.py --data data`, the `label accuracy:` line, and the Leave-one-placement-out block of `python3 train.py data` (A/B/C/D means and per-fold dicts), dated. Commit model.joblib only if the team decides to (G08 git-ignores it).",
+  "acceptance": "cd /home/user/qmind-step-detector && ls data | grep -cE '_(walk|run|still)_(hand|pocket)$' prints at least `10`; ./check.sh data; echo exit=$? ends with `CHECK OK` and `exit=0`; python3 evaluate.py --data data | grep -E '^(overall|label accuracy)' prints an `overall: true=<T> counted=<C> err=<e>%  <k>/<n> recordings within 3%` line and a `label accuracy:` line; grep -c 'overall: true=' README.md prints at least `1` (the pasted real-data line).",
+  "depends_on": [
+   "G08",
+   "T44"
+  ],
+  "size": "S",
+  "needs_human": true,
+  "evidence": "Verified",
+  "notes": "The recording itself has no code dependency and should happen as early as possible (same session as T44's gyro walk and G05's cellular check); only the check/paste step waits for G08. If check.sh fails on the real data, the failing line is the input to the next planning round (e.g. still recordings counting 1-2 steps). The 3% claim in the pitch should quote this README line, not the synthetic one. That T34 skips splits with `df[split].nunique() < 2` is Inference (T34's text not visible)."
+ }
+]
