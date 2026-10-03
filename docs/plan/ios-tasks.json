@@ -1,0 +1,150 @@
+[
+ {
+  "id": "IOS-BG-01",
+  "title": "Spike app: 100 Hz raw-accelerometer timestamp logger with switchable keep-alive",
+  "files": [
+   "ios/AccelSpike/AccelSpikeApp.swift",
+   "ios/AccelSpike/RawAccel.swift",
+   "ios/AccelSpike/KeepAlive.swift",
+   "ios/AccelSpike/Info.plist",
+   "tools/spike_gaps.py"
+  ],
+  "problem": "No source has measured 100 Hz raw startAccelerometerUpdates delivery with the screen locked under any keep-alive on iOS 16+; the only measurement is CMDeviceMotion at ~10 Hz (iOS 26.5.2). The team must measure on its own phones before committing to an architecture.",
+  "change": "Build a throwaway SwiftUI app with one CMMotionManager at accelerometerUpdateInterval = 0.01 on a serial OperationQueue, a keep-alive picker (none / location-3km / location-best / audio-silent / audio-click), Info.plist with UIBackgroundModes [location, audio] plus NSLocationWhenInUseUsageDescription and NSLocationAlwaysAndWhenInUseUsageDescription, lifecycle observers that write EVENT rows, and a buffered CSV writer (t_boot from CMAccelerometerData.timestamp, t_wall, x, y, z; 1 Hz heartbeat with batteryLevel, thermalState, isLowPowerModeEnabled, sample count) to Documents. Add tools/spike_gaps.py that computes delivery ratio, median/p99 dt, gap histogram (<15 ms, 15-50 ms, 50-500 ms, 0.5-2 s, >2 s), longest gap, and gaps aligned with EVENT rows.",
+  "acceptance": "App builds in Xcode and installs on a team iPhone via a free personal team; a 2-minute screen-on run produces a CSV with >= 11 880 samples (99 %), median dt 10.0 +/- 0.5 ms, and spike_gaps.py prints the histogram and pass/fail line for it.",
+  "depends_on": [],
+  "size": "M",
+  "needs_human": true,
+  "evidence": "Verified",
+  "notes": "Mac + Xcode + physical iPhone required (Simulator has no accelerometer). Launch from Home screen, not the debugger, for every background measurement."
+ },
+ {
+  "id": "IOS-BG-02",
+  "title": "Validation run: 10-minute pocket runs per keep-alive per phone, with pass/fail",
+  "files": [
+   "tools/spike_gaps.py",
+   "docs/ios-validation-results.md"
+  ],
+  "problem": "Whether 100 Hz raw accelerometer keeps flowing with the phone locked in a pocket under a location or audio keep-alive is unmeasured; the decision between location, audio and the Guided Access fallback must be data-driven.",
+  "change": "On every team iPhone model/iOS version, Low Power Mode off, no debugger: Control A (screen on, 2 min), Control B (no keep-alive, locked, 2 min, must fail), location-best and location-3km (10 min outdoors + 10 min indoors, locked, in pocket), audio-silent and audio-click (10 min, with a 30 s phone call and 1 min of Music during the run), Guided Access kiosk (15 min). Run spike_gaps.py on each CSV and record the table in docs/ios-validation-results.md with phone, iOS version, config, delivery ratio, median/p99 dt, longest gap, gap count > 100 ms, battery delta.",
+  "acceptance": "Results table filled for every phone. PASS criteria per main run: delivery >= 99.0 % (>= 59 400 samples/10 min), median dt 10.0 +/- 0.5 ms, p99 <= 20 ms, no gap > 2 s, <= 5 gaps > 100 ms, didEnterBackground EVENT followed by continuous samples; Control B shows delivery < 5 % (otherwise the harness is invalid). A written decision line names the primary keep-alive (or the Guided Access fallback) based on the numbers.",
+  "depends_on": [
+   "IOS-BG-01"
+  ],
+  "size": "S",
+  "needs_human": true,
+  "evidence": "Verified",
+  "notes": "A FAIL on location but PASS on audio switches the primary; FAIL on both means Guided Access for the demo plus CMSensorRecorder catch-up."
+ },
+ {
+  "id": "IOS-BG-03",
+  "title": "Keep-alive in the real app: When-In-Use standard location session with route/pace feature",
+  "files": [
+   "ios/StepDetector/Info.plist",
+   "ios/StepDetector/LocationKeepAlive.swift",
+   "ios/StepDetector/SessionViewModel.swift"
+  ],
+  "problem": "CMMotionManager callbacks stop within seconds of backgrounding unless something keeps the process awake; Apple DTS confirms a foreground-started standard location session does this by design and it is the only mechanism with a modern measurement.",
+  "change": "Add UIBackgroundModes = [location], NSLocationWhenInUseUsageDescription and NSLocationAlwaysAndWhenInUseUsageDescription. On Start (foreground, after requestWhenInUseAuthorization): desiredAccuracy = kCLLocationAccuracyBest (configurable to ThreeKilometers + distanceFilter 3000 for the low-power variant), distanceFilter = kCLDistanceFilterNone, activityType = .fitness, pausesLocationUpdatesAutomatically = false, allowsBackgroundLocationUpdates = true, showsBackgroundLocationIndicator = true, startUpdatingLocation(); never call startMonitoringSignificantLocationChanges. Keep didUpdateLocations trivial (append to route, compute distance/pace), keep the configuration constant for the session, and show authorizationStatus, isLowPowerModeEnabled, thermalState, batteryLevel and measured Hz in the UI with a 'location denied: counting stops at lock' warning.",
+  "acceptance": "With the phone locked in a pocket for 10 minutes, the app's own sample counter (from the serial queue) advances to >= 59 400 samples and the blue location indicator is visible; with authorization denied the UI shows the warning before Start. GPS distance and pace are displayed next to cadence.",
+  "depends_on": [
+   "IOS-BG-02"
+  ],
+  "size": "M",
+  "needs_human": true,
+  "evidence": "Verified",
+  "notes": "If IOS-BG-02 selected audio as primary instead, implement the mixable .playback session + always-rendering AVAudioEngine here instead and keep the location code behind a flag."
+ },
+ {
+  "id": "IOS-BG-04",
+  "title": "Lifecycle transition handling and stream watchdog",
+  "files": [
+   "ios/StepDetector/RawAccel.swift",
+   "ios/StepDetector/Lifecycle.swift"
+  ],
+  "problem": "Locking the device fires willResignActive/didEnterBackground; iOS 11 and iOS 13.1 reports show CoreMotion callbacks dying on the transition even with location/audio modes, and there is no screen-off notification. Timestamp gaps must be detected rather than assumed away.",
+  "change": "Observe willResignActive, didEnterBackground, willEnterForeground, didBecomeActive; log each with the sample count; on didEnterBackground and didBecomeActive call stopAccelerometerUpdates() then startAccelerometerUpdates(to:) again. Add a watchdog on the sample queue: no sample for > 1 s while recording -> log a gap event, restart the stream, set a fallback flag. Build 2 s windows from CMAccelerometerData.timestamp deltas (seconds since boot), never Date(); split windows on gaps > 2 samples.",
+  "acceptance": "A 10-minute locked pocket run's in-app lifecycle log shows the didEnterBackground restart and zero watchdog gap events; an induced gap (force a 3 s stop in a debug build) produces exactly one gap event and a successful restart with samples resuming within 1 s.",
+  "depends_on": [
+   "IOS-BG-03"
+  ],
+  "size": "S",
+  "needs_human": true,
+  "evidence": "Inference",
+  "notes": "The restart is insurance from pre-iOS-16 reports; no iOS 16+ source says it is needed or harmful."
+ },
+ {
+  "id": "IOS-BG-05",
+  "title": "In-pocket feedback channel: audible cadence click on a mixable audio session (second keep-alive)",
+  "files": [
+   "ios/StepDetector/Info.plist",
+   "ios/StepDetector/CadenceAudio.swift"
+  ],
+  "problem": "With the screen locked in a pocket nothing is visible; haptics do not fire unless foreground-active and Live Activities are refuted as a standalone channel. Audible feedback is the only verified in-pocket channel and DTS names 'audio and provide some kind of real-time feedback' as the legitimate use of the audio mode.",
+  "change": "Add 'audio' to UIBackgroundModes; AVAudioSession .playback with [.mixWithOthers], setActive(true) on Start from the foreground; AVAudioEngine with an AVAudioSourceNode that renders a short click on every beat at the cadence reported by the team's FFT plus a -60 dB non-zero bed between clicks; observe AVAudioSession.interruptionNotification and routeChangeNotification and restart the engine on .ended + .shouldResume; never deactivate the session on a lock-screen Pause while recording; optional MPNowPlayingInfoCenter line 'Cadence NNN spm, N steps'. Toggle in Settings (off by default for the demo without headphones).",
+  "acceptance": "With headphones, the click rate tracks the displayed cadence within 5 % during a 5-minute walk; a 30 s phone call interrupts and the engine resumes within 2 s of call end with the accelerometer sample counter still advancing; with Music playing both are audible.",
+  "depends_on": [
+   "IOS-BG-03"
+  ],
+  "size": "M",
+  "needs_human": true,
+  "evidence": "Verified",
+  "notes": "Also serves as the audio bridge DTS recommends if Core Location drops its assertion. Keep rendering non-zero samples; exact-zero streams risk the 'silent too long' interruption."
+ },
+ {
+  "id": "IOS-BG-06",
+  "title": "Fallback: CMSensorRecorder 50 Hz catch-up and CMPedometer comparison column",
+  "files": [
+   "ios/StepDetector/Info.plist",
+   "ios/StepDetector/RecorderFallback.swift",
+   "ios/StepDetector/GroundTruth.swift"
+  ],
+  "problem": "If the keep-alive fails (denied location, interruption, system termination) the app receives nothing while locked. The system recorder captures raw 50 Hz acceleration while the app is suspended, and CMPedometer gives an Apple reference count for the demo narrative.",
+  "change": "Add NSMotionUsageDescription. On Start and in sceneDidEnterBackground, off the main thread: if isAccelerometerRecordingAvailable(), recordAccelerometer(forDuration: 12*3600); persist the last processed startDate anchor. On sceneWillEnterForeground, when the watchdog flag is set or the live sample count is short, query accelerometerData(from: anchor, to: min(now, anchor+12h)) on a background queue, dedupe by startDate, multiply by 9.80665, split on gaps > 2 samples, run the pipeline with FS = 50 constants (N=100, min_gap 20/14, gravity alpha 1/51) and show the catch-up count labelled 'recorded in pocket (50 Hz)'. Show CMPedometer().queryPedometerData(from:to:) numberOfSteps as an 'Apple says' column (this call also triggers the Motion & Fitness prompt). Handle authorizationStatus() == .restricted with a 'turn on Fitness Tracking' hint.",
+  "acceptance": "On a phone where isAccelerometerRecordingAvailable() is true: after a 5-minute locked walk with the keep-alive deliberately disabled, reopening the app (after waiting 3 minutes) shows a recorder catch-up count within 15 % of the CMPedometer count and the manual count; on an unsupported phone the UI states 'recorder unavailable' without crashing.",
+  "depends_on": [
+   "IOS-BG-03"
+  ],
+  "size": "M",
+  "needs_human": true,
+  "evidence": "Verified",
+  "notes": "Apple engineer: the recorder has a large power impact; arm it only for a recording session. Device coverage undocumented; probe each phone."
+ },
+ {
+  "id": "IOS-BG-07",
+  "title": "Zero-permission demo fallback: Guided Access kiosk mode and runbook",
+  "files": [
+   "ios/StepDetector/KioskView.swift",
+   "docs/demo-runbook.md"
+  ],
+  "problem": "If the measured keep-alive fails on demo day, the only mechanism with no plist keys, no permissions and Apple-sanctioned API use is keeping the app foreground with the idle timer disabled while Guided Access blocks the side button and touch.",
+  "change": "Add a full-screen, control-free recording view: on Start set UIApplication.shared.isIdleTimerDisabled = true and UIScreen.main.brightness = 0.0, show a kiosk badge from UIAccessibility.isGuidedAccessEnabled, reset both on Stop, Stop requires a long press. Write docs/demo-runbook.md: enable Guided Access with passcode, Display Auto-Lock = Never, launch app, triple-click side button, turn off Side/Sleep-Wake Button, Touch and Volume Buttons, Start, pocket; end with triple-click + passcode; hard-reset chord note; Low Power Mode off.",
+  "acceptance": "A 15-minute pocket run under Guided Access on each team iOS version keeps the app foreground (no willResignActive in the log), the sample counter reaches >= 89 100 (99 %), and the screen does not blank or lock; the runbook has been followed by a team member who did not write it.",
+  "depends_on": [
+   "IOS-BG-01"
+  ],
+  "size": "S",
+  "needs_human": true,
+  "evidence": "Inference",
+  "notes": "Guided Access option names come from search snippets (support.apple.com blocked) and must be confirmed on the device; does not literally meet 'screen locked', say 'input-locked, screen dark' on the slide."
+ },
+ {
+  "id": "IOS-BG-08",
+  "title": "Demo acceptance run: locked-in-pocket walk compared against CMPedometer and manual count",
+  "files": [
+   "docs/ios-validation-results.md"
+  ],
+  "problem": "The pieces (keep-alive, transitions, feedback, fallback) have only been tested in isolation; the demo claim 'live count from our raw-accelerometer algorithm with the phone locked in a pocket' needs one end-to-end measurement with logs that explain any discrepancy.",
+  "change": "On each team phone, launched from the Home screen: Start, confirm blue pill, lock, pocket, walk a counted 300-step route (second person counts), 2 minutes standing still, 100 running steps; unlock and record the app count, CMPedometer count, manual count, lifecycle/watchdog log, measured Hz, battery delta. Repeat once with the keep-alive disabled to show the recorder catch-up path. Append to docs/ios-validation-results.md.",
+  "acceptance": "App count within 5 % of the manual count on the walk segment and within 10 % on the run segment on every phone, with the state timeline showing STILL during the pause; zero watchdog gaps in the keep-alive run; the recorder catch-up run shows a count within 15 % of manual; battery delta for the ~10-minute session recorded.",
+  "depends_on": [
+   "IOS-BG-03",
+   "IOS-BG-04",
+   "IOS-BG-06"
+  ],
+  "size": "S",
+  "needs_human": true,
+  "evidence": "Verified",
+  "notes": "If the keep-alive run fails the acceptance, the demo ships IOS-BG-07 and the slide states 'input-locked' rather than 'screen locked'."
+ }
+]
